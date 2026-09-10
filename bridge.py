@@ -55,9 +55,9 @@ MODELS = [
 
 # Fallback ladder for agy/agy-auto requests (tried in order).
 MODEL_LADDER = [
-    "gemini-3.8-flash-high",
-    "gemini-3.8-flash-medium",
-    "gemini-3.8-flash-low",
+    "gemini-3.7-flash-high",
+    "gemini-3.6-flash-high",
+    "gemini-3.6-flash-medium",
 ]
 
 # Concurrency: each request spawns its OWN independent agy stream-json child, so
