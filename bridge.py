@@ -60,10 +60,14 @@ MODEL_LADDER = [
     "gemini-3.8-flash-low",
 ]
 
-# Serialize all agy subprocess calls: agy has no built-in concurrency guard, and our
-# one-shot stream-json children are cheap. A semaphore also prevents the machine from
-# being thrashed by simultaneous requests.
-_sem = threading.BoundedSemaphore(1)
+# Concurrency: each request spawns its OWN independent agy stream-json child, so
+# parallel requests are safe. This BoundedSemaphore is only a global throttle to
+# avoid thrashing the machine with N heavy agy processes at once (each is a
+# 178MB Go binary + model context). Default concurrency 3: enough for chat to
+# sneak between fleet requests, small enough to keep RAM sane. Requests WAIT
+# (queue) rather than 503 — a slow fleet call must not fail chat turns.
+_SEM_SLOTS = int(os.environ.get("AGY_BRIDGE_CONCURRENCY", "3"))
+_sem = threading.BoundedSemaphore(_SEM_SLOTS)
 
 
 def resolve_model(name: str) -> str:
@@ -374,9 +378,9 @@ class Handler(BaseHTTPRequestHandler):
         if body.get("stream"):
             self._handle_stream(body, model, messages, prompt, req_id, tools, tool_choice, env_schema)
             return
-        ok = _sem.acquire(timeout=30)
+        ok = _sem.acquire(timeout=120)
         if not ok:
-            self._send(503, {"error": {"message": "bridge saturated", "type": "server_error"}})
+            self._send(503, {"error": {"message": "bridge saturated (concurrency queue full)", "type": "server_error"}})
             return
         try:
             obj, raw_obj, err, served_model = run_agy_smart(prompt, model, env_schema)
@@ -434,9 +438,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_stream(self, body, model, messages, prompt, req_id, tools=None, tool_choice=None, env_schema=None):
         """Synthesize a TERMINATING SSE stream from the agy one-shot result."""
-        ok = _sem.acquire(timeout=30)
+        ok = _sem.acquire(timeout=120)
         if not ok:
-            self._send(503, {"error": {"message": "bridge saturated", "type": "server_error"}})
+            self._send(503, {"error": {"message": "bridge saturated (concurrency queue full)", "type": "server_error"}})
             return
         try:
             obj, raw_obj, err, served_model = run_agy_smart(prompt, model, env_schema)
