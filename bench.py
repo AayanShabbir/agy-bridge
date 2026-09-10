@@ -6,9 +6,9 @@ Usage:
 Prints median + p95 of: total time, TTFB (time to first byte), and for
 for streaming: time-to-first-delta + total.
 """
-import argparse, json, statistics, subprocess, sys, time, urllib.request
+import argparse, json, os, statistics, subprocess, sys, time, urllib.request
 
-BASE = "http://127.0.0.1:8790/v1/chat/completions"
+BASE = os.environ.get("AGY_BRIDGE_PORT") and "http://127.0.0.1:%s/v1/chat/completions" % os.environ["AGY_BRIDGE_PORT"] or "http://127.0.0.1:8790/v1/chat/completions"
 
 
 def post(payload: dict, stream: bool):
