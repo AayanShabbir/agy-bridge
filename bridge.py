@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 
 HOME = os.path.expanduser("~")
 HOST = "127.0.0.1"
-PORT = 8790
+PORT = int(os.environ.get("AGY_BRIDGE_PORT", "8790"))
 AGY = os.environ.get("AGY_BIN", os.path.join(HOME, ".local", "bin", "agy"))
 LOG = os.path.join(HOME, ".hermes", "agy-bridge", "bridge.log")
 AGY_ACCOUNT = os.path.join(HOME, ".hermes", "bin", "agy-account.py")
