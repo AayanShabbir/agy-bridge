@@ -251,33 +251,71 @@ class CascadeClient:
 
     def turn(self, text, task_note="", timeout=240, model_enum=None):
         cid = self.ensure_cascade(text)
-        self.ch.rpc_ok("SendUserCascadeMessage", {
-            "cascadeId": cid,
-            "items": [{"text": text}],
-            "cascadeConfig": _cascade_config(model_enum),
-        }, timeout=40)
-
         subscriber = f"agy-bridge-{uuid.uuid4().hex[:12]}"
         answers = []
+        frame_q = queue.Queue()
 
-        def on_frame(data):
-            if not data:
-                return False
+        def _stream_worker():
+            def on_frame(data):
+                frame_q.put(data)
+                return False  # read everything; the main loop decides when to stop
+            try:
+                self.ch.stream("StreamAgentStateUpdates", {
+                    "conversationId": cid,
+                    "subscriberId": subscriber,
+                    "initialStepsPageBounds": {"startIndex": -50},
+                    "trajectoryVerbosity": VERBOSITY_FULL,
+                }, on_frame, timeout=max(10.0, min(timeout, 120.0)))
+            except Exception:
+                pass
+            finally:
+                frame_q.put(None)   # stream ended
+
+        # Rule 1: SUBSCRIBE FIRST (executor pushes updates only to attached
+        # subscribers), THEN send the message — exactly like the app's own UI.
+        th = threading.Thread(target=_stream_worker, daemon=True)
+        th.start()
+        attach_t = time.time()
+        while time.time() - attach_t < 8.0:
+            try:
+                first = frame_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if first is None:
+                break
+            frame_q.put(first)
+            break
+        try:
+            self.ch.rpc_ok("SendUserCascadeMessage", {
+                "cascadeId": cid,
+                "items": [{"text": text}],
+                "cascadeConfig": _cascade_config(model_enum),
+            }, timeout=40)
+        except AppLaneError:
+            self._stop_invocation(cid, force=True)
+            raise
+
+        # Rule 2: the PRE-RUN snapshot frame (frame 0) carries fullyIdle:true and
+        # must NEVER end the loop. Read frames; end only 5s after a real answer.
+        deadline = time.time() + min(max(timeout, 10.0), 60.0)
+        last_ans_at = [0.0]
+        while time.time() < deadline:
+            try:
+                data = frame_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if data is None:
+                break
+            u = data.get("update") or {}
+            # NOTE: the PRE-RUN snapshot frame lies — it carries fullyIdle:true
+            # too. Only end AFTER a real planner answer exists (post-frame-0).
             new_ans = self._planner_texts(data)
             if new_ans:
                 answers.extend(new_ans)
-                return True
-            u = data.get("update") or {}
-            if answers and (u.get("fullyIdle") is True or u.get("status") == "CASCADE_RUN_STATUS_IDLE"):
-                return True
-            return False
-
-        self.ch.stream("StreamAgentStateUpdates", {
-            "conversationId": cid,
-            "subscriberId": subscriber,
-            "initialStepsPageBounds": {"startIndex": -50},
-            "trajectoryVerbosity": VERBOSITY_FULL,
-        }, on_frame, timeout=max(10.0, min(timeout, 120.0)))
+                last_ans_at[0] = time.time()
+            if answers and time.time() - last_ans_at[0] > 5.0:
+                break
+        th.join(timeout=2)
 
         if not answers:
             try:
@@ -292,7 +330,15 @@ class CascadeClient:
 
         self._stop_invocation(cid, force=False)
         answers.sort(key=lambda t: t[0])
-        return answers[-1][1], cid
+        if not answers:
+            raise AppLaneError("app lane: no planner response text")
+        # Prefer a real answer over executor noise: drop echoes of the prompt,
+        # markup fragments, and single-char/symbol junk the planner can emit.
+        clean = [t for _, t in answers
+                 if t.strip() and t.strip() != text and len(t.strip()) >= 2
+                 and not t.strip().startswith(("<", ";", "=", "{", ">", "[", "\"", "'", "`", ")"))]
+        selected = (clean or [answers[-1][1]])[-1]
+        return selected, cid
 
     def _stop_invocation(self, cid, force=False):
         tries = ("ForceStopCascadeTree", "CancelCascadeInvocation") if force else ("CancelCascadeInvocation", "ForceStopCascadeTree")

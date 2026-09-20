@@ -40,7 +40,7 @@ PORT = int(os.environ.get("AGY_BRIDGE_PORT", "8790"))
 AGY = os.environ.get("AGY_BIN", os.path.join(HOME, ".local", "bin", "agy"))
 AGY_LANE = os.environ.get("AGY_LANE", "app")   # app = Antigravity app lane (default); sdk = API-key rollback
 _APP_MGR = [None]
-_APP_RETRIES = 1
+_APP_RETRIES = 2
 
 
 def _get_app_manager():
