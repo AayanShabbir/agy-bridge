@@ -20,9 +20,9 @@ WORKDIR /app
 COPY bridge.py .
 COPY app_lane.py .
 
-# Install google-antigravity (pure Python, arch-agnostic) for the SDK inference lane
-# (gemini models). Pulls absl-py, google-genai, mcp, protobuf, pydantic, uvicorn, websockets.
-RUN pip install --no-cache-dir "google-antigravity==0.1.16"
+# The app lane is stdlib-only (http.client + urllib); NO google-antigravity / SDK
+# in the container (Phase 3 hard gate: zero API keys in the bridge path).
+RUN python -c "import json, http.client, urllib.request; print('stdlib ok')"
 # Environment variables
 ENV BIND_HOST=0.0.0.0 \
     AGY_BRIDGE_PORT=8790 \

@@ -298,20 +298,27 @@ class CascadeClient:
             raise
 
         # Rule 2: the PRE-RUN snapshot frame (frame 0) carries fullyIdle:true and
-        # must NEVER end the loop. Read frames; end as soon as answer is received and
-        # engine is fullyIdle (or 1.5s after answer if idle frame missed).
+        # must NEVER end the loop. On conversation turns it ALSO replays the prior
+        # turn's answer (e.g. steps=[…, "ONE"]) — so answers must be ignored until
+        # this turn's stream transitions to RUNNING (saw_running), otherwise a stale
+        # replayed answer + the snapshot's fullyIdle ends the turn instantly.
         deadline = time.time() + min(max(timeout, 10.0), 60.0)
         last_ans_at = [0.0]
+        saw_running = False
         while time.time() < deadline:
             try:
                 data = frame_q.get(timeout=0.2)
             except queue.Empty:
-                if answers and (time.time() - last_ans_at[0] > 1.5):
+                if answers and saw_running and (time.time() - last_ans_at[0] > 1.5):
                     break
                 continue
             if data is None:
                 break
             u = data.get("update") or {}
+            if u.get("status") == "CASCADE_RUN_STATUS_RUNNING":
+                saw_running = True
+            if not saw_running:
+                continue  # skip pre-run snapshot / replayed prior-turn history
             new_ans = self._planner_texts(data)
             if new_ans:
                 answers.extend(new_ans)
