@@ -489,11 +489,16 @@ class AppLaneManager:
         """Re-read the registry for lane set/active. Cheap; called on config load."""
         lanes, active = load_registry_lanes(self._reg_path)
         for k, entry in lanes.items():
-            if k not in self._cfg:
+            port = int(entry.get("http_port") or 0)
+            csrf = entry.get("csrf") or ""
+            if k not in self._cfg or self._cfg[k].get("http_port") != port or self._cfg[k].get("csrf") != csrf:
+                # App restart => same lane key, NEW door. Always apply the freshest
+                # port/csrf so the bridge follows the moving door instead of holding
+                # a stale connection (Phase 4 roadmap: "app restarted" handling).
                 self._cfg[k] = {
                     "key": k,
-                    "http_port": int(entry.get("http_port") or 0),
-                    "csrf": entry.get("csrf") or "",
+                    "http_port": port,
+                    "csrf": csrf,
                     "model": entry.get("model", "gemini-3.8-flash"),
                     "source": "registry",
                     "registry": {x: entry.get(x) for x in ("app_pid", "ls_pid", "grpc_port", "updated_at")},
