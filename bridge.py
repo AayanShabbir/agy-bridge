@@ -40,7 +40,7 @@ def _get_app_manager():
     return _APP_MGR[0]
 
 
-def _app_lane_turn(conversation_id: str, user_text: str, timeout: float = 180.0):
+def _app_lane_turn(conversation_id: str, user_text: str, timeout: float = 180.0, model_enum: str = None):
     """Run one turn on the app lane (conversation-pinned or stateless).
     Returns (content, usage_dict). Raises for upstream/registration errors."""
     last_err = None
@@ -48,8 +48,8 @@ def _app_lane_turn(conversation_id: str, user_text: str, timeout: float = 180.0)
         mgr = _get_app_manager()
         try:
             if conversation_id:
-                return mgr.chat_lane(conversation_id, user_text, timeout=timeout)
-            return mgr.chat(user_text)
+                return mgr.chat_lane(conversation_id, user_text, timeout=timeout, model_enum=model_enum)
+            return mgr.chat(user_text, model_enum=model_enum)
         except Exception as ex:
             last_err = ex
             if attempt == _APP_RETRIES:
@@ -136,7 +136,16 @@ def resolve_model(name: str) -> str:
     if name in ("gemini-flash", "flash"):
         return "gemini-3.8-flash-medium"
     if name in ("gemini-pro", "pro"):
-        return "gemini-3.1-pro-high"
+        return "gemini-3.8-flash-high"
+    # App lane cannot construct executors for these model families (verified:
+    # "unknown model key" after the full 60s deadline). Alias to the nearest
+    # servable flash tier instead of hanging every request.
+    if name.startswith("gemini-3.1-pro-"):
+        suffix = name[len("gemini-3.1-pro-"):]
+        return "gemini-3.8-flash-" + (suffix if suffix in ("low", "medium", "high") else "medium")
+    if name.startswith("gemini-3.7-flash"):
+        suffix = name[len("gemini-3.7-flash-"):] if name.startswith("gemini-3.7-flash-") else ""
+        return "gemini-3.8-flash-" + (suffix if suffix in ("low", "medium", "high") else "medium")
     return name
 
 
@@ -621,14 +630,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             return
         if path in ("/health", "/"):
-            mgr = None
-            h = {"ok": False, "error": "app manager not initialized"}
-            if _APP_MGR[0] is not None:
-                mgr = _APP_MGR[0]
-                try:
-                    h = mgr.health()
-                except Exception as ex:
-                    h = {"ok": False, "error": str(ex)[:200]}
+            try:
+                mgr = _get_app_manager()
+                h = mgr.health()
+            except Exception as ex:
+                mgr = None
+                h = {"ok": False, "error": str(ex)[:200]}
             self._send(
                 200,
                 {
@@ -717,7 +724,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             t0 = time.time()
             try:
-                raw_text, usage_info = _app_lane_turn(conversation_id, last_user, timeout=180.0)
+                raw_text, usage_info = _app_lane_turn(conversation_id, last_user, timeout=180.0, model_enum=model)
             except Exception as ex:
                 self._send(502, {"error": {"message": f"app lane upstream error: {ex}", "type": "upstream_error"}})
                 return
@@ -730,7 +737,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "id": "chatcmpl-" + req_id,
                     "object": "chat.completion",
                     "created": int(time.time()),
-                    "model": "gemini-3.8-flash",
+                    "model": model,
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": safe_content}, "finish_reason": "stop"}],
                     "usage": usage_info,
                 },
@@ -758,11 +765,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
     ) -> None:
         t0 = time.time()
         raw_text = ""
-        served_model = "gemini-3.8-flash"
+        served_model = model
         usage_info = {}
 
         try:
-            raw_text, usage_info = _app_lane_turn(None, _last_user_text(messages) or prompt, timeout=180.0)
+            raw_text, usage_info = _app_lane_turn(None, prompt, timeout=180.0, model_enum=model)
         except Exception as ex:
             self._send(502, {"error": {"message": f"app lane upstream error: {ex}", "type": "upstream_error"}})
             return
@@ -839,9 +846,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         try:
             if conversation_id:
-                raw_text, usage_info = _app_lane_turn(conversation_id, last_user, timeout=180.0)
+                raw_text, usage_info = _app_lane_turn(conversation_id, last_user, timeout=180.0, model_enum=model)
             else:
-                raw_text, usage_info = _app_lane_turn(None, last_user or prompt, timeout=180.0)
+                raw_text, usage_info = _app_lane_turn(None, prompt, timeout=180.0, model_enum=model)
         except Exception as ex:
             self.wfile.write(self._sse(dict(base, choices=[{
                 "index": 0, "delta": {"role": "assistant", "content": f"[app lane error] {ex}"}, "finish_reason": None,

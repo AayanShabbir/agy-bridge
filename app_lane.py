@@ -108,6 +108,50 @@ def load_registry(path=None):
     return main
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 failover: multi-lane registry + exhaustion-triggered one-at-a-time flip
+# ---------------------------------------------------------------------------
+EXHAUSTION_TOKENS = (
+    "quota", "429", "402", "403", "402s", "exhausted", "not logged in",
+    "not logged into", "billing", "daily limit", "rate limit",
+    "resource exhausted", "high demand", "503", "temporarily unavailable",
+    "payment required", "sign in", "authentication required", "cloudcode",
+)
+
+
+def is_exhaustion_error(ex) -> bool:
+    """True when a lane error is an exhaustion signal (quota / not-logged-in /
+    payment / 403-429) that should trigger failover to the other account."""
+    s = (str(ex) or "").lower()
+    return any(t in s for t in EXHAUSTION_TOKENS)
+
+
+def load_registry_lanes(path=None):
+    """Return all complete lane entries keyed by name + the active lane name.
+    A lane is complete when it has a live http_port and csrf (a real app door)."""
+    path = path or DEFAULT_REGISTRY
+    try:
+        with open(path) as f:
+            reg = json.load(f)
+    except FileNotFoundError:
+        raise AppLaneError(f"app lane: registry not found at {path} — run lane_radar.py on the host")
+    raw = reg.get("lanes") or {}
+    lanes = {}
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        port = int(entry.get("http_port") or 0)
+        csrf = entry.get("csrf") or ""
+        if port and csrf:
+            lanes[key] = entry
+    active = reg.get("active") or "main"
+    if active not in lanes:
+        active = next(iter(lanes.keys()), None)
+    if not lanes:
+        raise AppLaneError(f"app lane: no complete lane entries in registry {path}")
+    return lanes, active
+
+
 def resolve_config():
     """Registry first; env overrides for tests (AGY_APP_HTTP_PORT, AGY_APP_CSRF)."""
     port = os.environ.get("AGY_APP_HTTP_PORT") or ""
@@ -251,7 +295,7 @@ class CascadeClient:
                 out.append((s.get("stepIndex", s.get("idx", 0)), t.strip()))
         return out
 
-    def turn(self, text, task_note="", timeout=240, model_enum=None):
+    def turn(self, text, task_note="", timeout=240, model_enum=None, delete_after=False):
         cid = self.ensure_cascade(text)
         subscriber = f"agy-bridge-{uuid.uuid4().hex[:12]}"
         answers = []
@@ -341,6 +385,13 @@ class CascadeClient:
             raise AppLaneError("app lane: no planner response text")
 
         self._stop_invocation(cid, force=False)
+        if delete_after:
+            # Stateless one-shot: free the cascade in the LS so turns don't
+            # pile up (each stateless turn otherwise leaves a cascade + DB).
+            try:
+                self.ch.rpc_ok("DeleteCascadeTrajectory", {"conversationId": cid}, timeout=10)
+            except Exception:
+                pass
         answers.sort(key=lambda t: t[0])
         if not answers:
             raise AppLaneError("app lane: no planner response text")
@@ -384,49 +435,132 @@ class CascadeClient:
 
 
 class AppLaneManager:
-    """Stateless turns + pinned conversation lanes, mirroring PersistentAgentPool API."""
-    def __init__(self, registry=None):
+    """Stateless turns + pinned conversation lanes, mirroring PersistentAgentPool API.
+
+    Phase 4 failover: reads ALL complete lanes from the registry (each = one app
+    door / one OAuth account). `active` = the lane used for NEW turns. When the
+    active lane raises an exhaustion signal (quota / not-logged-in / 402-429-403),
+    it is marked EXHAUSTED for AGY_FAILOVER_COOLDOWN seconds, active flips to the
+    next available account (one at a time), and the turn retries there. An
+    in-flight cascade always finishes on its own lane; the flip only affects new
+    turns. Conversation lanes pin to the account they started on.
+    """
+    def __init__(self, registry=None, account_labels=None):
         self._reg_path = registry or DEFAULT_REGISTRY
-        self._cfg = None
+        self._cfg = {}
         self._lanes = {}          # conversation_id -> CascadeClient
         self._lane_last = {}
+        self._conv_lane = {}      # conversation_id -> registry lane key (pin)
         self._client_lock = __import__("threading").Lock()
         self._stateless = None
         self.model_name = "gemini-3.8-flash"
+        # failover state
+        self._exhausted_until = {}   # lane key -> epoch when it re-arms
+        self._active = None
+        self._refresh()
 
-    def _config(self):
-        if self._cfg is None:
-            self._cfg = resolve_config() if self._reg_path == DEFAULT_REGISTRY else resolve_config()
-            self.model_name = self._cfg.get("model", self.model_name)
-        return self._cfg
+    def _refresh(self):
+        """Re-read the registry for lane set/active. Cheap; called on config load."""
+        lanes, active = load_registry_lanes(self._reg_path)
+        for k, entry in lanes.items():
+            if k not in self._cfg:
+                self._cfg[k] = {
+                    "key": k,
+                    "http_port": int(entry.get("http_port") or 0),
+                    "csrf": entry.get("csrf") or "",
+                    "model": entry.get("model", "gemini-3.8-flash"),
+                    "source": "registry",
+                    "registry": {x: entry.get(x) for x in ("app_pid", "ls_pid", "grpc_port", "updated_at")},
+                }
+                self._exhausted_until.setdefault(k, 0.0)
+        # drop lanes that vanished
+        for k in list(self._cfg.keys()):
+            if k not in lanes:
+                self._cfg.pop(k, None)
+                self._exhausted_until.pop(k, None)
+        if active and active in self._cfg:
+            self._active = active
+        elif self._cfg:
+            self._active = next(iter(self._cfg.keys()))
 
-    def _new_client(self):
-        return CascadeClient(self._config())
+    def _config(self, lane_key=None):
+        self._refresh()
+        lane = lane_key or self._active
+        if lane and lane in self._cfg:
+            self.model_name = self._cfg[lane].get("model", self.model_name)
+            return self._cfg[lane]
+        # fallback: single-lane legacy path
+        cfg = resolve_config()
+        return cfg
 
-    def chat(self, prompt):
-        """Stateless turn: fresh cascade per call."""
-        client = CascadeClient(self._config())
-        text, _ = client.turn(prompt)
-        return text, {}
+    def _new_client(self, lane_key=None):
+        return CascadeClient(self._config(lane_key))
+
+    def _available_lanes(self):
+        """Ordered lane keys usable for NEW turns: active first, then others."""
+        now = time.time()
+        lanes = list(self._cfg.keys())
+        if not lanes:
+            return []
+        ordered = [self._active] if self._active and self._active in lanes else []
+        ordered += [k for k in lanes if k not in ordered]
+        return [k for k in ordered if self._exhausted_until.get(k, 0.0) <= now]
+
+    def _mark_exhausted(self, lane_key, err):
+        cd = float(os.environ.get("AGY_FAILOVER_COOLDOWN", "600"))  # default 10 min
+        self._exhausted_until[lane_key] = time.time() + cd
+        self._last_exhaustion = {"lane": lane_key, "error": str(err)[:200], "at": time.time()}
+        # only flip active now; never mid-turn (new turns pick the new active).
+        if lane_key == self._active:
+            rest = [k for k in self._cfg.keys() if k != lane_key
+                    and self._exhausted_until.get(k, 0.0) <= time.time()]
+            if rest:
+                self._active = rest[0]
+
+    def chat(self, prompt, model_enum=None):
+        """Stateless turn: try active, then other non-exhausted lanes (failover)."""
+        last_err = None
+        for lane in self._available_lanes():
+            try:
+                client = CascadeClient(self._config(lane))
+                text, _ = client.turn(prompt, model_enum=model_enum, delete_after=True)
+                self._active = lane
+                return text, {}
+            except AppLaneError as ex:
+                last_err = ex
+                if is_exhaustion_error(ex):
+                    self._mark_exhausted(lane, ex)
+                    continue
+                raise
+        if last_err:
+            raise AppLaneError(f"all app lanes exhausted: {last_err}")
 
     def lanes(self):
         return list(self._lanes.keys())
 
-    def chat_lane(self, conversation_id, user_text, timeout=240.0):
+    def chat_lane(self, conversation_id, user_text, timeout=240.0, model_enum=None):
         with self._client_lock:
             client = self._lanes.get(conversation_id)
             if conversation_id not in self._lanes:
-                self._lanes[conversation_id] = self._new_client()
+                # pin to the ACCOUNT active when the lane was opened (no cross-account bleed)
+                lane_key = self._available_lanes()[0] if self._available_lanes() else (self._active or "main")
+                client = CascadeClient(self._config(lane_key))
+                client._lane_key = lane_key  # type: ignore[attr-defined]
+                self._lanes[conversation_id] = client
+                self._conv_lane[conversation_id] = lane_key
                 self._lane_last[conversation_id] = time.time()
-                client = self._lanes[conversation_id]
-        text, _ = client.turn(user_text, timeout=timeout)
+        text, _ = client.turn(user_text, timeout=timeout, model_enum=model_enum)
         return text, {}
 
     def acquire_for_lane(self, conversation_id):
         with self._client_lock:
             if conversation_id in self._lanes:
                 return True
-            self._lanes[conversation_id] = self._new_client()
+            lane_key = self._available_lanes()[0] if self._available_lanes() else (self._active or "main")
+            client = CascadeClient(self._config(lane_key))
+            client._lane_key = lane_key  # type: ignore[attr-defined]
+            self._lanes[conversation_id] = client
+            self._conv_lane[conversation_id] = lane_key
             self._lane_last[conversation_id] = time.time()
             return True
 
@@ -434,18 +568,45 @@ class AppLaneManager:
         with self._client_lock:
             self._lanes.pop(conversation_id, None)
             self._lane_last.pop(conversation_id, None)
+            self._conv_lane.pop(conversation_id, None)
 
     def active_lanes(self):
         return list(self._lanes.keys())
 
+    def lanes_summary(self):
+        """Phase 4 status: each registry lane + exhaustion/held-lane state."""
+        self._refresh()
+        out = []
+        now = time.time()
+        for k, cfg in self._cfg.items():
+            held = [cid for cid, lk in self._conv_lane.items() if lk == k]
+            ex = self._exhausted_until.get(k, 0.0)
+            out.append({
+                "name": k,
+                "port": cfg["http_port"],
+                "active": (k == self._active),
+                "exhausted": ex > now,
+                "exhausted_until": ex if ex > now else None,
+                "held_lanes": held,
+            })
+        return out
+
     def health(self):
-        cfg = self._config()
+        self._refresh()
+        if not self._cfg:
+            return {"ok": False, "error": "no app lane entries in registry", "lanes": []}
+        # probe the ACTIVE lane; report all lanes' status
+        lane = self._active or next(iter(self._cfg.keys()))
+        cfg = self._cfg[lane]
         try:
-            resp = self._new_client().ch.rpc_ok("GetUserStatus", {}, timeout=15)
+            resp = CascadeClient(cfg).ch.rpc_ok("GetUserStatus", {}, timeout=15)
             email = (((resp.get("userStatus") or {}).get("email")) or "unknown")
-            return {"ok": True, "email": email, "port": cfg["http_port"], "source": cfg.get("source")}
+            return {"ok": True, "email": email, "port": cfg["http_port"],
+                    "source": cfg.get("source"), "lane": lane,
+                    "lanes": self.lanes_summary()}
         except Exception as ex:
-            return {"ok": False, "error": str(ex)[:200], "port": cfg["http_port"]}
+            return {"ok": False, "error": str(ex)[:200], "port": cfg["http_port"],
+                    "lane": lane, "lanes": self.lanes_summary()}
 
 
 if __name__ == "__main__":
