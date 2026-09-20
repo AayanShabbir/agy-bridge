@@ -32,6 +32,9 @@ services:
       # App-lane registry: lane_radar.py on the host writes the brain's current
       # door + password here; the container reads it to find the Antigravity brain.
       - /Users/aayan/.veta/app-brains:/veta/app-brains:ro
+      # Live app lane code mounts so host improvements and fixes are immediately active
+      - /Users/aayan/.hermes/agy-bridge/app_lane.py:/app/app_lane.py:ro
+      - /Users/aayan/.hermes/agy-bridge/bridge.py:/app/bridge.py:ro
     
     # Restart policy: only restart on failure (unless-stopped)
     restart: unless-stopped

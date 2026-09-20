@@ -12,6 +12,8 @@ Flow per turn:
 
 Conversation lanes: one cascadeId per conversation_id (brain-native memory).
 """
+from __future__ import annotations
+
 import json
 import os
 import time
@@ -296,24 +298,27 @@ class CascadeClient:
             raise
 
         # Rule 2: the PRE-RUN snapshot frame (frame 0) carries fullyIdle:true and
-        # must NEVER end the loop. Read frames; end only 5s after a real answer.
+        # must NEVER end the loop. Read frames; end as soon as answer is received and
+        # engine is fullyIdle (or 1.5s after answer if idle frame missed).
         deadline = time.time() + min(max(timeout, 10.0), 60.0)
         last_ans_at = [0.0]
         while time.time() < deadline:
             try:
-                data = frame_q.get(timeout=0.5)
+                data = frame_q.get(timeout=0.2)
             except queue.Empty:
+                if answers and (time.time() - last_ans_at[0] > 1.5):
+                    break
                 continue
             if data is None:
                 break
             u = data.get("update") or {}
-            # NOTE: the PRE-RUN snapshot frame lies — it carries fullyIdle:true
-            # too. Only end AFTER a real planner answer exists (post-frame-0).
             new_ans = self._planner_texts(data)
             if new_ans:
                 answers.extend(new_ans)
                 last_ans_at[0] = time.time()
-            if answers and time.time() - last_ans_at[0] > 5.0:
+            if answers and (u.get("fullyIdle") is True or u.get("status") == "CASCADE_RUN_STATUS_IDLE"):
+                break
+            if answers and time.time() - last_ans_at[0] > 2.0:
                 break
         th.join(timeout=2)
 
