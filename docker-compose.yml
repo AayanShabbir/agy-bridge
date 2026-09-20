@@ -1,0 +1,72 @@
+version: '3.9'
+
+services:
+  agy-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agy-bridge
+    
+    # Network binding: host 127.0.0.1:8790 -> container 0.0.0.0:8790
+    # BIND_HOST env var is set in Dockerfile to override any hardcoded 127.0.0.1
+    ports:
+      - "127.0.0.1:8790:8790/tcp"
+    
+    environment:
+      # Override HOST binding inside container to 0.0.0.0 (app still sees 0.0.0.0 internally)
+      # Host port mapping keeps external access at 127.0.0.1 only (no LAN exposure)
+      BIND_HOST: "0.0.0.0"
+      AGY_BRIDGE_PORT: "8790"
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      # App lane: the Antigravity brain lives on the HOST, not in this container.
+      AGY_APP_HOST_OVERRIDE: "host.docker.internal"
+      AGY_APP_REGISTRY: "/veta/app-brains/registry.json"
+      AGY_LANE: "app"
+
+    # The bridge reads auth from ~/.hermes/.env.
+    # (The macOS arm64 `agy` CLI bind-mount was removed: Mach-O binary cannot run
+    #  in a linux/arm64 container — it served no purpose and only caused facade errors.)
+    volumes:
+      - /Users/aayan/.hermes/.env:/root/.hermes/.env:ro
+      # App-lane registry: lane_radar.py on the host writes the brain's current
+      # door + password here; the container reads it to find the Antigravity brain.
+      - /Users/aayan/.veta/app-brains:/veta/app-brains:ro
+    
+    # Restart policy: only restart on failure (unless-stopped)
+    restart: unless-stopped
+    
+    # Health check (container-level; image-level check also present)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import http.client; c = http.client.HTTPConnection('127.0.0.1', 8790); c.request('GET', '/health'); r = c.getresponse(); exit(0 if r.status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    
+    # Resource limits (adjust based on observed usage)
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "1.0"
+          memory: 512M
+    
+    # Logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # No persistent volumes needed (bridge is stateless)
+    # Named volume only if bridge.py writes persistent state
+    # volumes:
+    #   - agy-bridge-data:/app/data
+
+# Uncomment if persistent state is needed:
+# volumes:
+#   agy-bridge-data:
+#     driver: local

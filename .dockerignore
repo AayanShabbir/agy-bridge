@@ -1,0 +1,65 @@
+# Python environment & cache
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+dist
+build
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# Logs & temporary files
+*.log
+bridge.log
+bridge.stderr.log
+bridge.stdout.log
+*.tmp
+*.bak
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Development artifacts
+.pytest_cache
+.coverage
+htmlcov
+.mypy_cache
+.ruff_cache
+*.egg
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Research & documentation (keep lightweight)
+RESEARCH_*.md
+TOKEN_TRIM.md
+gbrain-page-*.md
+
+# Dev scripts & backups
+bench.py
+verify_bridge.py
+bridge.py.bak
+.agents/
+
+# Docker files (not needed in image)
+Dockerfile
+docker-compose.yml
+.dockerignore
