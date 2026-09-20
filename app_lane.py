@@ -32,17 +32,40 @@ PING_PROMPT = "Reply with exactly: PING_OK"
 DEFAULT_MODEL_ENUM = os.environ.get("AGY_APP_MODEL_ENUM", "MODEL_PLACEHOLDER_M319")  # Gemini 3.8 Flash (Medium)
 
 MODEL_MAP = {
-    "gemini-3.8-flash-low": "MODEL_PLACEHOLDER_M318",
+    # GEMINI 3.8 Flash family
+    "gemini-3.8-flash-low": "MODEL_PLACEHOLDER_M320",
     "gemini-3.8-flash-medium": "MODEL_PLACEHOLDER_M319",
-    "gemini-3.8-flash-high": "MODEL_PLACEHOLDER_M320",
+    "gemini-3.8-flash-high": "MODEL_PLACEHOLDER_M318",
     "gemini-3.8-flash": "MODEL_PLACEHOLDER_M319",
-    "gemini-3.7-flash-low": "MODEL_PLACEHOLDER_M310",
-    "gemini-3.7-flash-medium": "MODEL_PLACEHOLDER_M311",
-    "gemini-3.7-flash-high": "MODEL_PLACEHOLDER_M312",
-    "gemini-3.7-flash": "MODEL_PLACEHOLDER_M311",
-    "gemini-3.1-pro-low": "MODEL_PLACEHOLDER_M307",
-    "gemini-3.1-pro-high": "MODEL_PLACEHOLDER_M309",
+    # GEMINI 3.7 Flash family
+    "gemini-3.7-flash-low": "MODEL_PLACEHOLDER_M300",
+    "gemini-3.7-flash-medium": "MODEL_PLACEHOLDER_M299",
+    "gemini-3.7-flash-high": "MODEL_PLACEHOLDER_M298",
+    "gemini-3.7-flash": "MODEL_PLACEHOLDER_M299",
+    # GEMINI 3.6 Flash family
+    "gemini-3.6-flash-low": "MODEL_PLACEHOLDER_M73",
+    "gemini-3.6-flash-medium": "MODEL_PLACEHOLDER_M72",
+    "gemini-3.6-flash-high": "MODEL_PLACEHOLDER_M71",
+    "gemini-3.6-flash": "MODEL_PLACEHOLDER_M72",
+    # GEMINI 3.5 Flash family
+    "gemini-3.5-flash-low": "MODEL_PLACEHOLDER_M187",
+    "gemini-3.5-flash-medium": "MODEL_PLACEHOLDER_M20",
+    "gemini-3.5-flash-high": "MODEL_PLACEHOLDER_M84",
+    "gemini-3.5-flash-lite": "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE",
+    "gemini-3.5-flash": "MODEL_PLACEHOLDER_M20",
+    # GEMINI 3.1 Pro / Lite
+    "gemini-3.1-pro-low": "MODEL_PLACEHOLDER_M36",
+    "gemini-3.1-pro-high": "MODEL_PLACEHOLDER_M37",
+    "gemini-3.1-pro": "MODEL_PLACEHOLDER_M37",
+    "gemini-3.1-flash-lite": "MODEL_PLACEHOLDER_M50",
+    # GEMINI 2.5 Pro
+    "gemini-2.5-pro": "MODEL_GOOGLE_GEMINI_2_5_PRO",
+    # Claude family (Anthropic Vertex)
+    "claude-opus-4-6": "MODEL_PLACEHOLDER_M26",
+    "claude-opus-4-6-thinking": "MODEL_PLACEHOLDER_M26",
     "claude-sonnet-4-6": "MODEL_PLACEHOLDER_M35",
+    "claude-sonnet-4-6-thinking": "MODEL_PLACEHOLDER_M35",
+    # Open models
     "gpt-oss-120b-medium": "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
 }
 
@@ -346,7 +369,10 @@ class CascadeClient:
         # turn's answer (e.g. steps=[…, "ONE"]) — so answers must be ignored until
         # this turn's stream transitions to RUNNING (saw_running), otherwise a stale
         # replayed answer + the snapshot's fullyIdle ends the turn instantly.
-        deadline = time.time() + min(max(timeout, 10.0), 60.0)
+        # The bridge passes timeout=180; the old hard 60s cap converted slow-but-alive
+        # cascades into "no planner response text" failures under LS load. Cap high,
+        # never below what the caller asked for past the 10s floor.
+        deadline = time.time() + min(max(timeout, 10.0), 300.0)
         last_ans_at = [0.0]
         saw_running = False
         while time.time() < deadline:

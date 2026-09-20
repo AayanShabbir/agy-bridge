@@ -137,15 +137,6 @@ def resolve_model(name: str) -> str:
         return "gemini-3.8-flash-medium"
     if name in ("gemini-pro", "pro"):
         return "gemini-3.8-flash-high"
-    # App lane cannot construct executors for these model families (verified:
-    # "unknown model key" after the full 60s deadline). Alias to the nearest
-    # servable flash tier instead of hanging every request.
-    if name.startswith("gemini-3.1-pro-"):
-        suffix = name[len("gemini-3.1-pro-"):]
-        return "gemini-3.8-flash-" + (suffix if suffix in ("low", "medium", "high") else "medium")
-    if name.startswith("gemini-3.7-flash"):
-        suffix = name[len("gemini-3.7-flash-"):] if name.startswith("gemini-3.7-flash-") else ""
-        return "gemini-3.8-flash-" + (suffix if suffix in ("low", "medium", "high") else "medium")
     return name
 
 
