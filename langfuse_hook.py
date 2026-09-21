@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 import urllib.request
@@ -183,7 +184,43 @@ def _ring_sqlite_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-_ring_conn = None
+# SQLite connection is per-thread: the bridge is a ThreadingHTTPServer and a
+# module-global "sqlite3.Connection" is only usable in the thread that created it
+# ("SQLite objects created in a thread can only be used in that same thread").
+# threading.local() gives each worker its own handle; DELETE journal + busy_timeout
+# already make concurrent writers safe, so this is correctness without contention.
+_ring_tls = threading.local()
+
+
+def _ring_conn() -> sqlite3.Connection:
+    """Get (and lazily initialize) this thread's ring-buffer connection."""
+    conn = getattr(_ring_tls, "conn", None)
+    if conn is not None:
+        return conn
+    conn = sqlite3.connect(_RING_DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS jev_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lane TEXT NOT NULL DEFAULT 'primary',
+            port INTEGER NOT NULL DEFAULT 8790,
+            daemon TEXT NOT NULL DEFAULT 'agy-bridge',
+            model TEXT NOT NULL,
+            latency_ms REAL NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('success','error')),
+            error_class TEXT NOT NULL DEFAULT '',
+            timestamp_utc TEXT NOT NULL,
+            trace_id TEXT NOT NULL DEFAULT '',
+            gateway_decision TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jev_ts ON jev_events(timestamp_utc)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jev_status ON jev_events(status, timestamp_utc)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jev_err ON jev_events(error_class, timestamp_utc)")
+    conn.commit()
+    _ring_tls.conn = conn
+    return conn
 
 
 def _write_ring(*, model, latency_ms, status, error_class, error_text, timestamp, trace_id) -> None:
@@ -191,45 +228,25 @@ def _write_ring(*, model, latency_ms, status, error_class, error_text, timestamp
     FAIL-OPEN: never raise; never block inference. Uses default (DELETE) journal mode
     for cross-UID robustness (container root writes, host aayan reads) — WAL's -shm
     shared-memory file is the classic root-vs-user trap. Dir/db must be chmod 666."""
-    global _ring_conn, _RING_DB_PATH, _RING_ENABLED
+    global _RING_DB_PATH, _RING_ENABLED
     if not _RING_ENABLED:
         return
     try:
         if not model or status not in ("success", "error"):
             return
-        if _ring_conn is None:
-            _ring_conn = sqlite3.connect(_RING_DB_PATH, timeout=5)
-            _ring_conn.execute("PRAGMA journal_mode=DELETE")
-            _ring_conn.execute("PRAGMA busy_timeout=5000")
-            _ring_conn.execute("""CREATE TABLE IF NOT EXISTS jev_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lane TEXT NOT NULL DEFAULT 'primary',
-                port INTEGER NOT NULL DEFAULT 8790,
-                daemon TEXT NOT NULL DEFAULT 'agy-bridge',
-                model TEXT NOT NULL,
-                latency_ms REAL NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('success','error')),
-                error_class TEXT NOT NULL DEFAULT '',
-                timestamp_utc TEXT NOT NULL,
-                trace_id TEXT NOT NULL DEFAULT '',
-                gateway_decision TEXT NOT NULL DEFAULT ''
-            )""")
-            _ring_conn.execute("CREATE INDEX IF NOT EXISTS idx_jev_ts ON jev_events(timestamp_utc)")
-            _ring_conn.execute("CREATE INDEX IF NOT EXISTS idx_jev_status ON jev_events(status, timestamp_utc)")
-            _ring_conn.execute("CREATE INDEX IF NOT EXISTS idx_jev_err ON jev_events(error_class, timestamp_utc)")
-            _ring_conn.commit()
+        conn = _ring_conn()
         bucketed = _bucket_error(error_class, error_text=error_text, latency_ms=latency_ms)
-        _ring_conn.execute(
+        conn.execute(
             "INSERT INTO jev_events (model, latency_ms, status, error_class, timestamp_utc, trace_id) "
             "VALUES (?,?,?,?,?,?)",
             (model, latency_ms, status, bucketed, timestamp, trace_id),
         )
-        _ring_conn.execute("DELETE FROM jev_events WHERE timestamp_utc < datetime('now','-1 hour')")
-        _ring_conn.execute(
+        conn.execute("DELETE FROM jev_events WHERE timestamp_utc < datetime('now','-1 hour')")
+        conn.execute(
             "DELETE FROM jev_events WHERE id NOT IN "
             "(SELECT id FROM jev_events ORDER BY id DESC LIMIT 2000)"
         )
-        _ring_conn.commit()
+        conn.commit()
     except Exception as ex:
         print("[langfuse_hook] ring write FAILED (inference unaffected): %s" % ex, flush=True)
 
