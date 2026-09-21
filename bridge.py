@@ -41,7 +41,7 @@ def _get_app_manager():
     return _APP_MGR[0]
 
 
-def _app_lane_turn(conversation_id: str, user_text: str, timeout: float = 180.0, model_enum: str = None):
+def _app_lane_turn(conversation_id: str, user_text: str, timeout: float = 180.0, model_enum: str = None, on_heartbeat=None):
     """Run one turn on the app lane (conversation-pinned or stateless).
     Returns (content, usage_dict). Raises for upstream/registration errors.
     Traces every inference to LangFuse (fail-open) unless LANGFUSE_ENABLED=0."""
@@ -52,9 +52,9 @@ def _app_lane_turn(conversation_id: str, user_text: str, timeout: float = 180.0,
             mgr = _get_app_manager()
             try:
                 if conversation_id:
-                    _res = mgr.chat_lane(conversation_id, user_text, timeout=timeout, model_enum=model_enum)
+                    _res = mgr.chat_lane(conversation_id, user_text, timeout=timeout, model_enum=model_enum, on_heartbeat=on_heartbeat)
                 else:
-                    _res = mgr.chat(user_text, model_enum=model_enum)
+                    _res = mgr.chat(user_text, model_enum=model_enum, timeout=timeout, on_heartbeat=on_heartbeat)
                 _trace_call(conversation_id, user_text, model_enum, _res, _lf_t0, status="success", error=None, error_class=None)
                 return _res
             except Exception as ex:
@@ -897,11 +897,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
         last_user = _last_user_text(messages)
         base = {"id": "chatcmpl-" + req_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model}
 
+        # Heartbeat: keep the SSE wire alive with empty deltas while slow
+        # cascades (thinking models) produce nothing, so client-side
+        # no-output timeouts never fire mid-think. Content stays clean: the
+        # real text streams only after the turn selects its final answer.
+        _hb_gap = [0.0]
+
+        def _heartbeat():
+            now = time.time()
+            if now - _hb_gap[0] < 15.0:
+                return
+            _hb_gap[0] = now
+            try:
+                self.wfile.write(self._sse(dict(base, choices=[{
+                    "index": 0, "delta": {"content": ""}, "finish_reason": None,
+                }])))
+                self.wfile.flush()
+            except Exception:
+                pass
+
         try:
             if conversation_id:
-                raw_text, usage_info = _app_lane_turn(conversation_id, last_user, timeout=180.0, model_enum=model)
+                raw_text, usage_info = _app_lane_turn(conversation_id, last_user, timeout=180.0, model_enum=model, on_heartbeat=_heartbeat)
             else:
-                raw_text, usage_info = _app_lane_turn(None, prompt, timeout=180.0, model_enum=model)
+                raw_text, usage_info = _app_lane_turn(None, prompt, timeout=180.0, model_enum=model, on_heartbeat=_heartbeat)
         except Exception as ex:
             self.wfile.write(self._sse(dict(base, choices=[{
                 "index": 0, "delta": {"role": "assistant", "content": f"[app lane error] {ex}"}, "finish_reason": None,
