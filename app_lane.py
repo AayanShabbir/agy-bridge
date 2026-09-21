@@ -77,15 +77,30 @@ def resolve_model_enum(m: str | None) -> str:
     return MODEL_MAP.get(m.lower().strip(), DEFAULT_MODEL_ENUM)
 
 
+# Thinking models need a thinkingBudget in cascadeConfig or the app lane wedges.
+# (Fleet facts: "Thinking models require thinkingBudget in cascadeConfig." M26 needs 1024, M36/37 need 300.)
+THINKING_BUDGET = {
+    "MODEL_PLACEHOLDER_M26": 1024,  # claude-opus-4-6[-thinking]
+    "MODEL_PLACEHOLDER_M16": 300,   # gemini-pro-agent (deprecated alias)
+    "MODEL_PLACEHOLDER_M36": 300,   # gemini-3.1-pro-low
+    "MODEL_PLACEHOLDER_M37": 300,   # gemini-3.1-pro / -high
+}
+
 def _cascade_config(model_enum=None):
-    """Minimal cascadeConfig the executor needs: a valid planner/requested model."""
+    """Minimal cascadeConfig the executor needs: a valid planner/requested model.
+    Injects thinkingBudget for thinking models (required, or the lane wedges)."""
     m = resolve_model_enum(model_enum)
-    return {
+    cfg = {
         "plannerConfig": {
             "planModel": m,
             "requestedModel": {"model": m},
         }
     }
+    budget = THINKING_BUDGET.get(m)
+    if budget:
+        cfg["plannerConfig"]["thinkingBudget"] = budget
+        cfg["plannerConfig"]["requestedModel"]["thinkingBudget"] = budget
+    return cfg
 
 
 class AppLaneError(Exception):
@@ -318,7 +333,44 @@ class CascadeClient:
                 out.append((s.get("stepIndex", s.get("idx", 0)), t.strip()))
         return out
 
-    def turn(self, text, task_note="", timeout=240, model_enum=None, delete_after=False):
+    def turn(self, text, task_note="", timeout=240, model_enum=None, delete_after=False, on_heartbeat=None):
+        """One app-lane turn.
+
+        Lane turns (delete_after=False) retry ONCE on a fresh cascade when the
+        first attempt fails: the post-answer cancel race can leave a cascade
+        stuck RUNNING+not_fully_idle in the brain (executor gone, state never
+        flushed), and every later turn on that same cascade then stacks on the
+        phantom and hangs/replays — the lane "loop". Stateless turns never retry
+        (they delete-after and the error is the caller's to surface).
+        """
+        for _repair in (0, 1):
+            try:
+                return self._turn_impl(text, task_note, timeout, model_enum,
+                                       delete_after, on_heartbeat)
+            except AppLaneError:
+                if delete_after or _repair == 1:
+                    raise
+                self._repair_cascade(self.cascade_id)
+        raise AppLaneError("app lane: turn failed")  # pragma: no cover
+
+    def _repair_cascade(self, cid):
+        """Reset a cascade so the next turn starts clean: stop any lingering
+        executor, delete the (possibly torn) trajectory, drop the cached id.
+        Never raises — worst case the turn fails again and the watchdog reaps
+        the daemon."""
+        if not cid:
+            return
+        try:
+            self._stop_invocation(cid, force=True)
+        except Exception:
+            pass
+        try:
+            self.ch.rpc_ok("DeleteCascadeTrajectory", {"conversationId": cid}, timeout=10)
+        except Exception:
+            pass
+        self.cascade_id = None
+
+    def _turn_impl(self, text, task_note="", timeout=240, model_enum=None, delete_after=False, on_heartbeat=None):
         cid = self.ensure_cascade(text)
         subscriber = f"agy-bridge-{uuid.uuid4().hex[:12]}"
         answers = []
@@ -334,7 +386,7 @@ class CascadeClient:
                     "subscriberId": subscriber,
                     "initialStepsPageBounds": {"startIndex": -50},
                     "trajectoryVerbosity": VERBOSITY_FULL,
-                }, on_frame, timeout=max(10.0, min(timeout, 120.0)))
+                }, on_frame, timeout=max(10.0, min(timeout, 200.0)))
             except Exception:
                 pass
             finally:
@@ -374,8 +426,15 @@ class CascadeClient:
         # never below what the caller asked for past the 10s floor.
         deadline = time.time() + min(max(timeout, 10.0), 300.0)
         last_ans_at = [0.0]
+        last_hb_at = [0.0]
         saw_running = False
         while time.time() < deadline:
+            if on_heartbeat and time.time() - last_hb_at[0] >= 15.0:
+                last_hb_at[0] = time.time()
+                try:
+                    on_heartbeat()
+                except Exception:
+                    pass
             try:
                 data = frame_q.get(timeout=0.2)
             except queue.Empty:
@@ -383,6 +442,13 @@ class CascadeClient:
                     break
                 continue
             if data is None:
+                # Subscription expired while the cascade is still working:
+                # re-attach and keep collecting (a fresh subscription replays
+                # recent steps, so answers produced meanwhile are not lost).
+                if not answers and time.time() < deadline:
+                    th = threading.Thread(target=_stream_worker, daemon=True)
+                    th.start()
+                    continue
                 break
             u = data.get("update") or {}
             if u.get("status") == "CASCADE_RUN_STATUS_RUNNING":
@@ -410,7 +476,13 @@ class CascadeClient:
             self._stop_invocation(cid, force=True)
             raise AppLaneError("app lane: no planner response text")
 
-        self._stop_invocation(cid, force=False)
+        # FIX(2026-09-21): no unconditional post-answer cancel. The executor is
+        # already done when the answer lands ("executor is not currently
+        # running"), so the cancel hit nothing — but if it landed in the gap
+        # before the cascade flushed IDLE, it tore the state (RUNNING +
+        # not_fully_idle forever) and every later lane turn stacked on the
+        # phantom: hangs + replayed answers. The cascade finalizes to IDLE on
+        # its own; only force-stop when there was no answer (above).
         if delete_after:
             # Stateless one-shot: free the cascade in the LS so turns don't
             # pile up (each stateless turn otherwise leaves a cascade + DB).
@@ -548,13 +620,14 @@ class AppLaneManager:
             if rest:
                 self._active = rest[0]
 
-    def chat(self, prompt, model_enum=None):
+    def chat(self, prompt, model_enum=None, timeout=240, on_heartbeat=None):
         """Stateless turn: try active, then other non-exhausted lanes (failover)."""
         last_err = None
         for lane in self._available_lanes():
             try:
                 client = CascadeClient(self._config(lane))
-                text, _ = client.turn(prompt, model_enum=model_enum, delete_after=True)
+                text, _ = client.turn(prompt, model_enum=model_enum, timeout=timeout,
+                                      delete_after=True, on_heartbeat=on_heartbeat)
                 self._active = lane
                 return text, {}
             except AppLaneError as ex:
@@ -569,7 +642,7 @@ class AppLaneManager:
     def lanes(self):
         return list(self._lanes.keys())
 
-    def chat_lane(self, conversation_id, user_text, timeout=240.0, model_enum=None):
+    def chat_lane(self, conversation_id, user_text, timeout=240.0, model_enum=None, on_heartbeat=None):
         with self._client_lock:
             client = self._lanes.get(conversation_id)
             if conversation_id not in self._lanes:
@@ -580,7 +653,7 @@ class AppLaneManager:
                 self._lanes[conversation_id] = client
                 self._conv_lane[conversation_id] = lane_key
                 self._lane_last[conversation_id] = time.time()
-        text, _ = client.turn(user_text, timeout=timeout, model_enum=model_enum)
+        text, _ = client.turn(user_text, timeout=timeout, model_enum=model_enum, on_heartbeat=on_heartbeat)
         return text, {}
 
     def acquire_for_lane(self, conversation_id):
