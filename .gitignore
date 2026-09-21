@@ -1,2 +1,5 @@
 __pycache__/
 *.log
+# JEV ring buffer runtime data (inference telemetry) — never commit
+state/
+*.db

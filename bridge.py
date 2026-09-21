@@ -25,6 +25,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+import langfuse_hook
 
 HOME = os.path.expanduser("~")
 HOST = os.environ.get("BIND_HOST", "127.0.0.1")
@@ -42,20 +43,49 @@ def _get_app_manager():
 
 def _app_lane_turn(conversation_id: str, user_text: str, timeout: float = 180.0, model_enum: str = None):
     """Run one turn on the app lane (conversation-pinned or stateless).
-    Returns (content, usage_dict). Raises for upstream/registration errors."""
-    last_err = None
-    for attempt in range(_APP_RETRIES + 1):
-        mgr = _get_app_manager()
-        try:
-            if conversation_id:
-                return mgr.chat_lane(conversation_id, user_text, timeout=timeout, model_enum=model_enum)
-            return mgr.chat(user_text, model_enum=model_enum)
-        except Exception as ex:
-            last_err = ex
-            if attempt == _APP_RETRIES:
-                break
-            time.sleep(1.5)
-    raise last_err
+    Returns (content, usage_dict). Raises for upstream/registration errors.
+    Traces every inference to LangFuse (fail-open) unless LANGFUSE_ENABLED=0."""
+    _lf_t0 = time.time()
+    try:
+        last_err = None
+        for attempt in range(_APP_RETRIES + 1):
+            mgr = _get_app_manager()
+            try:
+                if conversation_id:
+                    _res = mgr.chat_lane(conversation_id, user_text, timeout=timeout, model_enum=model_enum)
+                else:
+                    _res = mgr.chat(user_text, model_enum=model_enum)
+                _trace_call(conversation_id, user_text, model_enum, _res, _lf_t0, status="success", error=None, error_class=None)
+                return _res
+            except Exception as ex:
+                last_err = ex
+                if attempt == _APP_RETRIES:
+                    break
+                time.sleep(1.5)
+        raise last_err
+    except Exception as final_ex:
+        _trace_call(conversation_id, user_text, model_enum, None, _lf_t0, status="error", error=str(final_ex), error_class=type(final_ex).__name__)
+        raise
+
+
+def _trace_call(conversation_id, prompt, model, res, t0, *, status, error, error_class):
+    """FAIL-OPEN: emit a LangFuse trace; never raise into the inference path."""
+    try:
+        if os.environ.get("LANGFUSE_ENABLED", "1") == "0":
+            return
+        langfuse_hook.emit_call(
+            model=model or "unknown",
+            prompt=(prompt or "")[:2000],
+            output=(res[0] if isinstance(res, tuple) else str(res or ""))[:2000] if res else (error or ""),
+            start_time=t0,
+            end_time=time.time(),
+            status=status,
+            error=error,
+            error_class=error_class,
+            conversation_id=conversation_id or "",
+        )
+    except Exception:
+        pass
 
 
 def _last_user_text(messages: list) -> str:

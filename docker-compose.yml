@@ -23,6 +23,8 @@ services:
       AGY_APP_HOST_OVERRIDE: "host.docker.internal"
       AGY_APP_REGISTRY: "/veta/app-brains/registry.json"
       AGY_LANE: "app"
+      JEV_RING_DB: "/state/jev_ring.db"
+      JEV_RING_ENABLED: "1"
 
     # The bridge reads auth from ~/.hermes/.env.
     # (The macOS arm64 `agy` CLI bind-mount was removed: Mach-O binary cannot run
@@ -34,7 +36,9 @@ services:
       - /Users/aayan/.veta/app-brains:/veta/app-brains:ro
       # Live app lane code mounts so host improvements and fixes are immediately active
       - /Users/aayan/.hermes/agy-bridge/app_lane.py:/app/app_lane.py:ro
+      - /Users/aayan/.hermes/agy-bridge/langfuse_hook.py:/app/langfuse_hook.py:ro
       - /Users/aayan/.hermes/agy-bridge/bridge.py:/app/bridge.py:ro
+      - /Users/aayan/.hermes/agy-bridge/state:/state
     
     # Restart policy: only restart on failure (unless-stopped)
     restart: unless-stopped
