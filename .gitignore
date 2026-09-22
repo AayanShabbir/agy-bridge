@@ -1,4 +1,6 @@
 __pycache__/
+.pytest_cache/
+tests/.pytest_cache/
 *.log
 # JEV ring buffer runtime data (inference telemetry) — never commit
 state/
