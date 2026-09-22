@@ -1,0 +1,13 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "type": "function",
+      "function": {
+        "name": "run_command",
+        "arguments": {"CommandLine": "ls -la"}
+      },
+      "id": "call_001"
+    }
+  ]
+}

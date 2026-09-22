@@ -1,0 +1,9 @@
+{
+  "content": "I will look up the weather for you.",
+  "tool_calls": [
+    {
+      "name": "lookup_weather",
+      "arguments": {"city": "Boston, MA"}
+    }
+  ]
+}

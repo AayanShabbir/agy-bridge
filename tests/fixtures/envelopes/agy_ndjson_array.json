@@ -1,0 +1,15 @@
+[
+  {
+    "content": "First token block.",
+    "tool_calls": []
+  },
+  {
+    "content": "Second token block.",
+    "tool_calls": [
+      {
+        "name": "final_answer",
+        "arguments": {"response": "The answer is 42"}
+      }
+    ]
+  }
+]
