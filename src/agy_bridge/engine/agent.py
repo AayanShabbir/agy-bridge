@@ -234,6 +234,7 @@ class AgyCompletionEngine:
         frame_q: "queue.Queue[Any]" = queue.Queue()
         stream_timeout = max(10.0, min(self.timeout, 200.0))
         cascade_id: Optional[str] = None
+        upstream_conversation_id = conversation_id
         stream_thread: Optional[threading.Thread] = None
 
         def _stream_worker() -> None:
@@ -243,7 +244,7 @@ class AgyCompletionEngine:
                     endpoint,
                     "StreamAgentStateUpdates",
                     {
-                        "conversationId": conversation_id,
+                        "conversationId": upstream_conversation_id,
                         "subscriberId": subscriber_id,
                         "initialStepsPageBounds": {"startIndex": -50},
                         "trajectoryVerbosity": VERBOSITY_FULL,
@@ -275,6 +276,7 @@ class AgyCompletionEngine:
                 )
             cascade_id = start_resp["cascadeId"]
             assert cascade_id is not None  # _pre_send_fail raised otherwise
+            upstream_conversation_id = cascade_id
 
             # 2. Subscribe FIRST, then verify attachment (baseline snapshot).
             #    The server only pushes updates to attached subscribers.
@@ -318,7 +320,7 @@ class AgyCompletionEngine:
                     self.transport.unary(
                         endpoint,
                         "DeleteCascadeTrajectory",
-                        {"conversationId": conversation_id},
+                        {"conversationId": upstream_conversation_id},
                         timeout=10,
                     )
                 except Exception:

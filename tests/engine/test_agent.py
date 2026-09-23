@@ -114,7 +114,51 @@ def test_full_turn_returns_attributed_content(tmp_path):
     assert result["finish_reason"] == "stop"
     assert result["model"] == "gemini-3.8-flash"
     # deletes the stateless cascade
-    assert ("DeleteCascadeTrajectory", {"conversationId": "conv-1"}) in transport.calls
+    assert ("DeleteCascadeTrajectory", {"conversationId": "c-1"}) in transport.calls
+
+
+def test_upstream_stream_and_cleanup_use_started_cascade_id(tmp_path, monkeypatch):
+    import agy_bridge.engine.agent as agent_module
+
+    engine, transport, leases, _ = make_engine(
+        {
+            "StartCascade": {"cascadeId": "cascade-test-123"},
+            "SendUserCascadeMessage": {},
+            "StreamAgentStateUpdates": [
+                {"frame": snap()},
+                {"frame": snap("CASCADE_RUN_STATUS_RUNNING", steps=[step(0, "ANSWER")])},
+                {"frame": snap(steps=[step(0, "ANSWER")])},
+                {"trailer": {"status": 0}},
+            ],
+            "DeleteCascadeTrajectory": {},
+        },
+        tmp_path,
+    )
+    original_lifecycle = agent_module.TurnLifecycleCoordinator
+    lifecycle_conversation_ids = []
+    lease_conversation_ids = []
+    original_acquire_lease = leases.acquire_conversation_lease
+
+    def track_conversation_lease(conversation_id, *args, **kwargs):
+        lease_conversation_ids.append(conversation_id)
+        return original_acquire_lease(conversation_id, *args, **kwargs)
+
+    class TrackingLifecycle(original_lifecycle):
+        def __init__(self, *args, **kwargs):
+            lifecycle_conversation_ids.append(kwargs["conversation_id"])
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(agent_module, "TurnLifecycleCoordinator", TrackingLifecycle)
+    monkeypatch.setattr(leases, "acquire_conversation_lease", track_conversation_lease)
+    engine.execute_completion(request(conversation_id="local-conversation-42"))
+
+    stream_payload = next(payload for method, payload in transport.calls if method == "StreamAgentStateUpdates")
+    assert stream_payload["conversationId"] == "cascade-test-123"
+    assert ("DeleteCascadeTrajectory", {"conversationId": "cascade-test-123"}) in transport.calls
+    assert lifecycle_conversation_ids == ["local-conversation-42"]
+    assert leases.get_active_lease("local-conversation-42") is None
+    assert leases.get_active_lease("cascade-test-123") is None
+    assert lease_conversation_ids == ["local-conversation-42"]
 
 
 def test_replayed_prior_step_is_not_attributed(tmp_path):
