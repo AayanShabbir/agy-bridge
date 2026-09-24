@@ -4,7 +4,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agy_bridge.api.app import create_app
-from agy_bridge.errors import RateLimitExceeded, UpstreamUnavailable
+from agy_bridge.errors import RateLimitExceeded, UpstreamError, UpstreamUnavailable
 
 
 class FakeCompletionEngine:
@@ -172,3 +172,16 @@ def test_chat_completions_rate_limit_error_returns_429():
     data = r.json()
     assert data["error"]["code"] == "rate_limit_exceeded"
     assert data["error"]["type"] == "upstream_error"
+
+
+def test_missing_forced_tool_is_upstream_failure_not_success():
+    client = TestClient(create_app(engine=FakeCompletionEngine(
+        fails_with=UpstreamError("Named tool 'lookup' was not emitted"))))
+    response = client.post("/v1/chat/completions", json={
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Call lookup"}],
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+    })
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_error"
