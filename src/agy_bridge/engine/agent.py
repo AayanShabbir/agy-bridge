@@ -29,6 +29,7 @@ import queue
 import threading
 import time
 import uuid
+import weakref
 from typing import Any, Callable, Dict, List, Optional
 
 from agy_bridge.engine.leases import LeaseCoordinator
@@ -45,11 +46,23 @@ from agy_bridge.errors import (
     UpstreamTimeout,
 )
 from agy_bridge.protocol.trajectory import parse_agent_state_update, reduce_update
+from agy_bridge.api.envelope import parse_envelope
+from agy_bridge.telemetry import emit_call
 
 SOURCE_CASCADE_CLIENT = "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT"
 VERBOSITY_FULL = "CLIENT_TRAJECTORY_VERBOSITY_FULL"
 CASCADE_RUNNING = "CASCADE_RUN_STATUS_RUNNING"
 _STREAM_OPENED = object()
+_ENGINE_INSTANCES = weakref.WeakSet()
+_ENGINE_REAPER_LOCK = threading.Lock()
+_ENGINE_REAPER_STARTED = False
+
+
+def _reap_engine_lanes() -> None:
+    while True:
+        for engine in list(_ENGINE_INSTANCES):
+            engine._expire_lanes()
+        time.sleep(30)
 
 DEFAULT_MODEL_ENUM = os.environ.get("AGY_APP_MODEL_ENUM", "MODEL_PLACEHOLDER_M319")
 
@@ -137,11 +150,23 @@ def _text_of(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("text"))
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                parts.append(str(part))
+            elif part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+            elif part.get("type") == "image_url":
+                info = part.get("image_url") or {}
+                url = info.get("url", "") if isinstance(info, dict) else str(info)
+                parts.append(f"[Embedded Image data ({len(url)} bytes)]" if url.startswith("data:") else f"[Image URL: {url}]")
+            else:
+                parts.append(str(part))
+        return "\n".join(parts)
     return str(content)
 
 
-def render_prompt(messages: list, model: str = "") -> str:
+def render_prompt(messages: list, model: str = "", tools: Optional[list] = None, tool_choice: Any = None) -> str:
     """Flatten OpenAI message history into the app-lane prompt.
 
     Mirrors production bridge.py flattening: role tags, tool results,
@@ -149,7 +174,24 @@ def render_prompt(messages: list, model: str = "") -> str:
     """
     if not messages:
         raise UnsupportedInputError("messages must be a non-empty list")
-    parts = [TEXT_BACKEND_FRAME]
+    if tools and tool_choice != "none":
+        parts = ["You are working through an API bridge that lets you call functions. Do not invent tools."]
+        lines = ["TOOL CATALOG (you may call these):"]
+        for tool in tools:
+            fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+            props = (fn.get("parameters") or {}).get("properties") or {}
+            args = ", ".join(f"{k}{'' if (v or {}).get('type') == 'string' else '=?'}" for k, v in list(props.items())[:12])
+            lines.append(f"- {fn.get('name', '?')}({args}): {str(fn.get('description', ''))[:200]}")
+        parts.append("\n".join(lines))
+        if isinstance(tool_choice, dict):
+            required_name = (tool_choice.get("function") or {}).get("name", "")
+            parts.append(f"You MUST call '{required_name}' and return only JSON with content and tool_calls.")
+        elif tool_choice == "required":
+            parts.append('You MUST call one tool. Return only JSON: {"content":null,"tool_calls":[{"name":"...","arguments":{}}]}')
+        else:
+            parts.append('When calling a tool return JSON: {"content":null,"tool_calls":[{"name":"...","arguments":{}}]}. Otherwise answer normally.')
+    else:
+        parts = [TEXT_BACKEND_FRAME]
     for m in messages:
         if not isinstance(m, dict):
             continue
@@ -207,23 +249,75 @@ class AgyCompletionEngine:
         self.attach_timeout = attach_timeout
         self.delete_after = delete_after
         self.min_deadline_s = min_deadline_s
+        self._lane_lock = threading.RLock()
+        self._lanes: Dict[str, dict] = {}
+        global _ENGINE_REAPER_STARTED
+        _ENGINE_INSTANCES.add(self)
+        with _ENGINE_REAPER_LOCK:
+            if not _ENGINE_REAPER_STARTED:
+                threading.Thread(target=_reap_engine_lanes, daemon=True, name="agy-lane-idle-reaper").start()
+                _ENGINE_REAPER_STARTED = True
+
+    def health(self) -> dict:
+        try:
+            # Refresh the file-backed registry on each readiness probe. The
+            # cache's 30s safety window is for failed reads, not a lease expiry.
+            endpoint = self.registry.refresh()
+            result = self.transport.unary(endpoint, "GetUserStatus", {}, timeout=5)
+            return {"ok": True, "source": "registry", "lane": result}
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__}
+
+    def lanes(self) -> list:
+        self._expire_lanes()
+        with self._lane_lock:
+            return list(self._lanes)
+
+    def acquire_for_lane(self, conversation_id: str) -> None:
+        self._expire_lanes()
+        with self._lane_lock:
+            if conversation_id not in self._lanes:
+                endpoint = self.scheduler.select_endpoint()
+                now = time.monotonic()
+                self._lanes[conversation_id] = {"created": now, "last": now, "endpoint": endpoint}
+
+    def release_lane(self, conversation_id: str) -> None:
+        with self._lane_lock:
+            lane = self._lanes.pop(conversation_id, None)
+        if lane and lane.get("cascade_id"):
+            try:
+                self.transport.unary(lane["endpoint"], "DeleteCascadeTrajectory",
+                                     {"conversationId": lane["cascade_id"]}, timeout=10)
+            except Exception:
+                pass
+
+    def _expire_lanes(self) -> None:
+        ttl = float(os.environ.get("AGY_LANE_IDLE_TTL", "1800"))
+        now = time.monotonic()
+        with self._lane_lock:
+            expired = [cid for cid, lane in self._lanes.items()
+                       if now - lane.get("last", now) > ttl]
+        for cid in expired:
+            self.release_lane(cid)
 
     # -- request entry -------------------------------------------------------
 
     def execute_completion(self, request_data: dict) -> dict:
+        started_at = time.time()
         model = str(request_data.get("model") or "gemini-3.8-flash")
         messages = request_data.get("messages") or []
-        prompt = render_prompt(messages, model=model)
-        conversation_id = (
-            request_data.get("conversation_id")
-            or request_data.get("conversationId")
-            or f"conv-{uuid.uuid4().hex[:12]}"
-        )
+        prompt = render_prompt(messages, model=model, tools=request_data.get("tools"), tool_choice=request_data.get("tool_choice"))
+        supplied_conversation_id = request_data.get("conversation_id") or request_data.get("conversationId")
+        stateful = bool(supplied_conversation_id)
+        conversation_id = supplied_conversation_id or f"conv-{uuid.uuid4().hex[:12]}"
+        self._expire_lanes()
+        with self._lane_lock:
+            lane = self._lanes.get(conversation_id) if stateful else None
         request_id = str(request_data.get("request_id") or uuid.uuid4().hex)
         turn_id = uuid.uuid4().hex[:12]
         subscriber_id = f"{request_id}-{turn_id}"
 
-        endpoint = self.scheduler.select_endpoint()  # cooldown-aware admission
+        endpoint = lane["endpoint"] if lane and lane.get("endpoint") else self.scheduler.select_endpoint()
         conv_lease = self.leases.acquire_conversation_lease(conversation_id, turn_id)
         engine_lease = self.leases.acquire_engine_lease(endpoint.engine_id, turn_id)
         lifecycle = TurnLifecycleCoordinator(
@@ -235,6 +329,8 @@ class AgyCompletionEngine:
         frame_q: "queue.Queue[Any]" = queue.Queue()
         stream_timeout = max(10.0, min(self.timeout, 200.0))
         cascade_id: Optional[str] = None
+        new_stateful_cascade = bool(stateful and not (lane and lane.get("cascade_id")))
+        stateful_cascade_retained = False
         upstream_conversation_id = conversation_id
         stream_thread: Optional[threading.Thread] = None
 
@@ -265,18 +361,17 @@ class AgyCompletionEngine:
             stream_thread.start()
 
         try:
-            # 1. Start the cascade
-            start_resp = self.transport.unary(
-                endpoint,
-                "StartCascade",
-                {"source": SOURCE_CASCADE_CLIENT, "prompt": prompt},
-                timeout=40,
-            )
-            if not isinstance(start_resp, dict) or not start_resp.get("cascadeId"):
-                self._pre_send_fail(
-                    lifecycle, endpoint, UpstreamError("StartCascade returned no cascadeId")
+            # Stateful lanes reuse their safely retained upstream cascade identity.
+            if lane and lane.get("cascade_id"):
+                cascade_id = lane["cascade_id"]
+            else:
+                start_resp = self.transport.unary(
+                    endpoint, "StartCascade",
+                    {"source": SOURCE_CASCADE_CLIENT, "prompt": prompt}, timeout=40,
                 )
-            cascade_id = start_resp["cascadeId"]
+                if not isinstance(start_resp, dict) or not start_resp.get("cascadeId"):
+                    self._pre_send_fail(lifecycle, endpoint, UpstreamError("StartCascade returned no cascadeId"))
+                cascade_id = start_resp["cascadeId"]
             assert cascade_id is not None  # _pre_send_fail raised otherwise
             upstream_conversation_id = cascade_id
 
@@ -287,6 +382,27 @@ class AgyCompletionEngine:
             _relaunch_stream()
             self._wait_attachment(frame_q, lifecycle)
             baseline = 0
+            if lane and lane.get("cascade_id"):
+                # A retained cascade may replay its prior trajectory. Capture an
+                # idle snapshot before sending so old steps cannot be attributed.
+                try:
+                    prior = frame_q.get(timeout=self.attach_timeout)
+                except queue.Empty:
+                    self._pre_send_fail(lifecycle, endpoint, UpstreamError(
+                        "Retained cascade did not provide an idle baseline"))
+                if prior is None or isinstance(prior, Exception) or prior is _STREAM_OPENED:
+                    self._pre_send_fail(lifecycle, endpoint, UpstreamError(
+                        "Retained cascade did not provide an idle baseline"))
+                update = prior.get("update", prior) if isinstance(prior, dict) else {}
+                status = str(update.get("status") or "")
+                if status == CASCADE_RUNNING or not (status.endswith("IDLE") or update.get("fullyIdle")):
+                    self._pre_send_fail(lifecycle, endpoint, UpstreamError(
+                        "Retained cascade baseline was not idle; refusing unsafe turn"))
+                # Legacy cascade updates omit stepIndex on incremental steps.
+                # Use content fingerprints from the idle snapshot to suppress
+                # replayed prior answers while allowing a new unindexed step.
+                lifecycle.observation._dedupe_seen.extend(self._planner_responses(prior))
+                baseline = 0
             lifecycle.record_attachment(baseline)
 
             # 3. Send the turn message exactly once
@@ -309,16 +425,50 @@ class AgyCompletionEngine:
             # 4. Consume until terminal evidence or deadline
             self._consume_turn(lifecycle, endpoint, frame_q, _relaunch_stream)
 
-            content = "".join(lifecycle.observation.emitted_text_chunks).strip()
+            raw_content = "".join(lifecycle.observation.emitted_text_chunks).strip()
+            effective_tools = None if request_data.get("tool_choice") == "none" else request_data.get("tools")
+            content, envelope_tools = parse_envelope(raw_content, tools=effective_tools)
+            raw_tools = []
+            if effective_tools:
+                raw_tools = list(lifecycle.observation.emitted_tool_calls)
+                raw_tools.extend(call for call in envelope_tools if call not in raw_tools)
+            tool_calls = []
+            for index, call in enumerate(raw_tools):
+                fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = call.get("name") or fn.get("name") or "?"
+                args = call.get("arguments", call.get("parameters", call.get("args", fn.get("arguments", {}))))
+                args_json = args if isinstance(args, str) else json.dumps(args, separators=(",", ":"))
+                tool_calls.append({"id": call.get("id") or f"call_{request_id}_{index}", "type": "function",
+                                   "function": {"name": name, "arguments": args_json}})
+            usage = {}
+            emit_call(model=model, prompt=prompt, output=content, start_time=started_at,
+                      end_time=time.time(), status="success", conversation_id=conversation_id, usage=usage)
             self.scheduler.tracker.record_success(endpoint.account_id)
-            return {"content": content, "finish_reason": "stop", "model": model}
+            if stateful:
+                with self._lane_lock:
+                    self._lanes[conversation_id] = {"created": (lane or {}).get("created", time.monotonic()),
+                                                    "last": time.monotonic(), "endpoint": endpoint,
+                                                    "cascade_id": cascade_id}
+                stateful_cascade_retained = True
+            return {"content": content, "tool_calls": tool_calls, "finish_reason": "tool_calls" if tool_calls else "stop",
+                    "usage": usage, "model": model}
         except AgyBridgeError as ex:
+            emit_call(model=model, prompt=prompt, output="", start_time=started_at, end_time=time.time(),
+                      status="error", error=str(ex), error_class=type(ex).__name__,
+                      conversation_id=conversation_id, usage={})
             self.scheduler.tracker.record_failure(endpoint.account_id, error_kind(ex))
+            raise
+        except Exception as ex:
+            emit_call(model=model, prompt=prompt, output="", start_time=started_at, end_time=time.time(),
+                      status="error", error=str(ex), error_class=type(ex).__name__,
+                      conversation_id=conversation_id, usage={})
             raise
         finally:
             if stream_thread is not None:
                 stream_thread.join(timeout=1.0)
-            if self.delete_after and cascade_id is not None:
+            if self.delete_after and cascade_id is not None and (
+                not stateful or (new_stateful_cascade and not stateful_cascade_retained)
+            ):
                 try:
                     self.transport.unary(
                         endpoint,
@@ -372,6 +522,28 @@ class AgyCompletionEngine:
         ]
         return (max(indexes) + 1) if indexes else 0
 
+    @staticmethod
+    def _all_steps(data: dict) -> list:
+        update = data.get("update") if isinstance(data.get("update"), dict) else data
+        traj = update.get("trajectory") if isinstance(update.get("trajectory"), dict) else update
+        mtu = traj.get("mainTrajectoryUpdate")
+        if isinstance(mtu, dict):
+            traj = mtu
+        container = traj.get("stepsUpdate") if isinstance(traj.get("stepsUpdate"), dict) else traj
+        steps = container.get("steps")
+        return steps if isinstance(steps, list) else []
+
+    @classmethod
+    def _planner_responses(cls, data: dict) -> list[str]:
+        responses = []
+        for step in cls._all_steps(data):
+            if not isinstance(step, dict) or not isinstance(step.get("plannerResponse"), dict):
+                continue
+            response = step["plannerResponse"].get("modifiedResponse") or step["plannerResponse"].get("response")
+            if isinstance(response, str) and response:
+                responses.append(response)
+        return responses
+
     def _consume_turn(
         self,
         lifecycle: TurnLifecycleCoordinator,
@@ -382,7 +554,9 @@ class AgyCompletionEngine:
         """Consume frames until terminal evidence, re-attaching once if needed."""
         deadline = time.monotonic() + min(max(self.timeout, self.min_deadline_s), 300.0)
         saw_running = False
-        baseline_open = True
+        # Retained-cascade baselines were captured before send; do not let a
+        # replayed post-send idle snapshot raise the index floor again.
+        baseline_open = not bool(lifecycle.observation._dedupe_seen)
         reattached = False
 
         while time.monotonic() < deadline:

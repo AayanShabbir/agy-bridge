@@ -7,7 +7,7 @@ from agy_bridge.api.tools import validate_and_parse_tool_calls
 from agy_bridge.errors import ToolContractViolationError
 
 
-def test_image_input_rejected_before_admission_returns_400():
+def test_image_input_uses_legacy_placeholder_path():
     app = create_app()
     client = TestClient(app)
 
@@ -27,10 +27,9 @@ def test_image_input_rejected_before_admission_returns_400():
         ],
     }
     r = client.post("/v1/chat/completions", json=payload)
-    assert r.status_code == 400
+    assert r.status_code == 503
     data = r.json()
-    assert data["error"]["code"] == "unsupported_image_input"
-    assert data["error"]["type"] == "invalid_request_error"
+    assert data["error"]["code"] == "upstream_unavailable"
 
 
 def test_valid_tool_calls_normalized():

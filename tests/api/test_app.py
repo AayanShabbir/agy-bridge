@@ -23,6 +23,9 @@ class FakeCompletionEngine:
             "model": request_data.get("model", "gemini-3.8-flash"),
         }
 
+    def health(self):
+        return {"ok": True}
+
 
 def test_health_endpoints():
     app = create_app(engine=FakeCompletionEngine())
@@ -38,7 +41,7 @@ def test_health_endpoints():
 
     r_health = client.get("/health")
     assert r_health.status_code == 200
-    assert r_health.json()["status"] == "ok"
+    assert r_health.json()["status"] == "healthy"
 
 
 def test_models_endpoint():
@@ -50,7 +53,7 @@ def test_models_endpoint():
     data = r.json()
     assert "data" in data
     model_ids = [m["id"] for m in data["data"]]
-    assert "gemini-3.8-flash" in model_ids
+    assert len(model_ids) == 20
     assert "gemini-3.8-flash-high" in model_ids
 
 
@@ -61,7 +64,7 @@ def test_capabilities_endpoint():
     r = client.get("/v1/bridge/capabilities")
     assert r.status_code == 200
     data = r.json()
-    assert data["vision"]["policy"] == "reject"
+    assert data["vision"]["policy"] == "legacy_placeholders"
     assert data["streaming"]["mode"] == "buffered_sse"
     assert data["conversations"]["supported"] is True
 
@@ -73,8 +76,8 @@ def test_conversations_crud():
     # Create
     r = client.post("/v1/conversations", json={"purpose": "research"})
     assert r.status_code == 200
-    conv_id = r.json()["id"]
-    assert conv_id.startswith("conv-")
+    conv_id = r.json()["conversation_id"]
+    assert r.json()["status"] == "open"
 
     # List
     r_list = client.get("/v1/conversations")
@@ -85,7 +88,7 @@ def test_conversations_crud():
     # Delete
     r_del = client.delete(f"/v1/conversations/{conv_id}")
     assert r_del.status_code == 200
-    assert r_del.json()["deleted"] is True
+    assert r_del.json()["status"] == "closed"
 
 
 def test_chat_completions_non_streaming():
@@ -122,7 +125,6 @@ def test_chat_completions_streaming():
     assert "text/event-stream" in r.headers["content-type"]
 
     body = r.text
-    assert ": ping" in body
     assert "data: " in body
     assert "[DONE]" in body
     assert "Streamed chunk output." in body

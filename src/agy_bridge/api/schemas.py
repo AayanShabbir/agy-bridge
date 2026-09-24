@@ -11,10 +11,11 @@ class ChatMessage(BaseModel):
     content: Optional[Union[str, List[Any]]] = ""
     name: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "gemini-3.8-flash"
+    model: Optional[str] = None
     messages: List[ChatMessage]
     stream: bool = False
     temperature: Optional[float] = None

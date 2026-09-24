@@ -10,9 +10,12 @@ def format_sse_chunk(
     delta_content: Optional[str] = None,
     delta_tool_calls: Optional[list] = None,
     finish_reason: Optional[str] = None,
+    delta_role: Optional[str] = None,
 ) -> str:
     """Format one SSE data frame matching OpenAI streaming chunk contract."""
     delta: Dict[str, Any] = {}
+    if delta_role is not None:
+        delta["role"] = delta_role
     if delta_content is not None:
         delta["content"] = delta_content
     if delta_tool_calls is not None:

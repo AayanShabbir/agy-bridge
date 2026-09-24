@@ -38,12 +38,15 @@ def test_bootstrap_builds_and_runs_app(tmp_path: Path):
     # Health check
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json()["status"] == "ok"
+    assert r.json()["status"] == "degraded"
+    assert r.json()["app_lane"]["ok"] is False
+    assert r.json()["active_lanes"] == 0
+    assert r.json()["port"] == 8790
 
     # Models check
     r_models = client.get("/v1/models")
     assert r_models.status_code == 200
-    assert len(r_models.json()["data"]) > 0
+    assert len(r_models.json()["data"]) == 20
 
 
 def test_bootstrap_wires_real_engine_that_hits_transport(tmp_path: Path):

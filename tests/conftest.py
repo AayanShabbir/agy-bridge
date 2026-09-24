@@ -5,10 +5,14 @@ manager substitutes the real AppLaneManager and returns recorded responses;
 the fake registry writes a temp registry.json pointing at a dead port.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
+
+# Tests must never write into the host/runtime JEV ring by default.
+os.environ["JEV_RING_ENABLED"] = "0"
 
 # Make the repo root importable so `import bridge` / `import app_lane` work
 # without installing the package.

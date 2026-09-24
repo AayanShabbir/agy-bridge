@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+LABEL org.opencontainers.image.title="agy-bridge-p14-candidate"
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir '.[api]'
+ENV AGY_BRIDGE_HOST=0.0.0.0 \
+    AGY_BRIDGE_PORT=8790 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+EXPOSE 8790
+HEALTHCHECK --interval=20s --timeout=6s --start-period=10s --retries=3 \
+  CMD python -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8790/health', timeout=4)); exit(0 if d.get('status') == 'healthy' else 1)"
+CMD ["python", "-m", "agy_bridge"]

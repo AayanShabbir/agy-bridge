@@ -6,7 +6,7 @@ from agy_bridge.api.app import create_app
 from agy_bridge.api.tools import validate_and_parse_tool_calls, ToolContractViolationError
 
 
-def test_vision_reject_policy_returns_400():
+def test_vision_legacy_placeholder_reaches_engine_admission():
     app = create_app()
     client = TestClient(app)
 
@@ -23,10 +23,9 @@ def test_vision_reject_policy_returns_400():
         ],
     }
     r = client.post("/v1/chat/completions", json=payload)
-    assert r.status_code == 400
+    assert r.status_code == 503
     data = r.json()
-    assert data["error"]["code"] == "unsupported_image_input"
-    assert "image" in data["error"]["message"].lower()
+    assert data["error"]["code"] == "upstream_unavailable"
 
 
 def test_validate_and_parse_valid_tool_call():

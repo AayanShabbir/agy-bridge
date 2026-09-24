@@ -79,7 +79,7 @@ def make_engine(script, tmp_path, *, timeout: float = 240.0, min_deadline_s: flo
     return engine, transport, leases, tracker
 
 
-def request(messages=None, model="gemini-3.8-flash", conversation_id="conv-1"):
+def request(messages=None, model="gemini-3.8-flash", conversation_id=None):
     return {
         "model": model,
         "messages": messages or [{"role": "user", "content": "hello"}],
@@ -118,6 +118,88 @@ def test_full_turn_returns_attributed_content(tmp_path):
     assert ("DeleteCascadeTrajectory", {"conversationId": "c-1"}) in transport.calls
 
 
+def test_stateful_lane_reuses_cascade_and_releases_on_close(tmp_path):
+    class ReusedCascadeTransport(ScriptedTransport):
+        def __init__(self):
+            super().__init__()
+            self.turn = 0
+
+        def subscribe(self, endpoint, method, payload, *, on_frame, timeout=60.0, on_open=None):
+            self.calls.append((method, payload))
+            if on_open:
+                on_open()
+            self.turn += 1
+            old_step = {"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE", "plannerResponse": {"response": "LANE-PERSIST-61"}}
+            prior = snap(steps=[old_step]) if self.turn == 2 else snap()
+            frames = [prior, snap("CASCADE_RUN_STATUS_RUNNING", steps=[old_step])]
+            if self.turn == 1:
+                frames.append(snap("CASCADE_RUN_STATUS_RUNNING", steps=[step(0, "LANE-PERSIST-61")]))
+                frames.append(snap(steps=[step(0, "LANE-PERSIST-61")]))
+            else:
+                frames.append(snap("CASCADE_RUN_STATUS_RUNNING", steps=[old_step]))
+                frames.append(snap("CASCADE_RUN_STATUS_RUNNING", steps=[{"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "plannerResponse": {"response": "RECALLED"}}]))
+                frames.append(snap(steps=[{"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE", "plannerResponse": {"response": "RECALLED"}}]))
+            for frame in frames:
+                on_frame(frame)
+            return SubscriptionResult(outcome=SubscriptionResult.COMPLETED)
+
+        def unary(self, endpoint, method, payload, *, timeout=30.0):
+            self.calls.append((method, payload))
+            if method == "StartCascade":
+                return {"cascadeId": "returned-cascade-61"}
+            return {}
+
+    engine, _, _, _ = make_engine({}, tmp_path)
+    transport = ReusedCascadeTransport()
+    engine.transport = transport
+    engine.acquire_for_lane("lane-persist")
+    one = request(conversation_id="lane-persist", messages=[{"role": "user", "content": "remember LANE-PERSIST-61"}])
+    two = request(conversation_id="lane-persist", messages=[{"role": "user", "content": "what was the token?"}])
+    engine.execute_completion(one)
+    result = engine.execute_completion(two)
+    assert result["content"] == "RECALLED"
+    assert [m for m, _ in transport.calls].count("StartCascade") == 1
+    assert [m for m, _ in transport.calls].count("SendUserCascadeMessage") == 2
+    assert [p["conversationId"] for m, p in transport.calls if m == "StreamAgentStateUpdates"] == [
+        "returned-cascade-61", "returned-cascade-61"]
+    assert not any(m == "DeleteCascadeTrajectory" for m, _ in transport.calls)
+    engine.release_lane("lane-persist")
+    assert ("DeleteCascadeTrajectory", {"conversationId": "returned-cascade-61"}) in transport.calls
+
+
+def test_stateful_lane_idle_expiry_releases_cascade(tmp_path, monkeypatch):
+    engine, transport, _, _ = make_engine({}, tmp_path)
+    endpoint = engine.registry.get_active_endpoint()
+    engine._lanes["expired"] = {"last": 0, "endpoint": endpoint, "cascade_id": "safe-returned-id"}
+    monkeypatch.setenv("AGY_LANE_IDLE_TTL", "1")
+    engine._expire_lanes()
+    assert "expired" not in engine.lanes()
+    assert ("DeleteCascadeTrajectory", {"conversationId": "safe-returned-id"}) in transport.calls
+
+
+def test_engine_formats_legacy_tool_envelope(tmp_path):
+    envelope = '{"content":null,"tool_calls":[{"name":"lookup","arguments":{"q":"x"}}]}'
+    script = {
+        "StartCascade": {"cascadeId": "tool-cascade"},
+        "SendUserCascadeMessage": {},
+        "StreamAgentStateUpdates": [
+            {"frame": snap()},
+            {"frame": snap("CASCADE_RUN_STATUS_RUNNING", steps=[step(0, envelope)])},
+            {"frame": snap(steps=[step(0, envelope)])},
+            {"trailer": {"status": 0}},
+        ],
+        "DeleteCascadeTrajectory": {},
+    }
+    engine, _, _, _ = make_engine(script, tmp_path)
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    result = engine.execute_completion({**request(), "tools": tools, "tool_choice": "required"})
+    assert result["content"] == ""
+    assert result["finish_reason"] == "tool_calls"
+    assert result["tool_calls"][0]["function"] == {"name": "lookup", "arguments": '{"q":"x"}'}
+    assert result["tool_calls"][0]["id"].startswith("call_")
+
+
 def test_upstream_stream_and_cleanup_use_started_cascade_id(tmp_path, monkeypatch):
     import agy_bridge.engine.agent as agent_module
 
@@ -151,15 +233,15 @@ def test_upstream_stream_and_cleanup_use_started_cascade_id(tmp_path, monkeypatc
 
     monkeypatch.setattr(agent_module, "TurnLifecycleCoordinator", TrackingLifecycle)
     monkeypatch.setattr(leases, "acquire_conversation_lease", track_conversation_lease)
-    engine.execute_completion(request(conversation_id="local-conversation-42"))
+    engine.execute_completion(request(conversation_id=None))
 
     stream_payload = next(payload for method, payload in transport.calls if method == "StreamAgentStateUpdates")
     assert stream_payload["conversationId"] == "cascade-test-123"
     assert ("DeleteCascadeTrajectory", {"conversationId": "cascade-test-123"}) in transport.calls
-    assert lifecycle_conversation_ids == ["local-conversation-42"]
-    assert leases.get_active_lease("local-conversation-42") is None
+    assert lifecycle_conversation_ids and lifecycle_conversation_ids[0] != "cascade-test-123"
+    assert leases.get_active_lease(lifecycle_conversation_ids[0]) is None
     assert leases.get_active_lease("cascade-test-123") is None
-    assert lease_conversation_ids == ["local-conversation-42"]
+    assert lease_conversation_ids == lifecycle_conversation_ids
 
 
 def test_replayed_prior_step_is_not_attributed(tmp_path):
