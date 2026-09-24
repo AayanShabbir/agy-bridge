@@ -17,7 +17,7 @@ services:
       JEV_RING_ENABLED: "1"
       LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:?required}"
       LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:?required}"
-      LANGFUSE_BASE_URL: "http://host.docker.internal:3000"
+      LANGFUSE_BASE_URL: "${LANGFUSE_BASE_URL:?required}"
     volumes:
       - /Users/aayan/.veta/app-brains:/veta/app-brains:ro
       - agy-bridge-p15-stage-state:/state
