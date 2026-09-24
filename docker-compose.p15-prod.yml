@@ -1,0 +1,31 @@
+services:
+  agy-bridge:
+    image: agy-bridge:p15-candidate
+    pull_policy: never
+    container_name: agy-bridge
+    ports:
+      - "127.0.0.1:8790:8790/tcp"
+    environment:
+      AGY_BRIDGE_HOST: "0.0.0.0"
+      AGY_BRIDGE_PORT: "8790"
+      AGY_APP_HOST_OVERRIDE: "host.docker.internal"
+      AGY_APP_REGISTRY: "/veta/app-brains/registry.json"
+      AGY_LANE: "app"
+      JEV_RING_DB: "/state/jev_ring.db"
+      JEV_RING_ENABLED: "1"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:?required}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:?required}"
+      LANGFUSE_BASE_URL: "${LANGFUSE_BASE_URL:?required}"
+    volumes:
+      - /Users/aayan/.veta/app-brains:/veta/app-brains:ro
+      - agy-bridge-p15-prod-state:/state
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8790/health', timeout=4)); exit(0 if d.get('status') == 'healthy' else 1)"]
+      interval: 20s
+      timeout: 6s
+      start_period: 10s
+      retries: 3
+volumes:
+  agy-bridge-p15-prod-state:
+    name: agy-bridge-p15-prod-state
