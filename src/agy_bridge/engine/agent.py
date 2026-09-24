@@ -440,6 +440,15 @@ class AgyCompletionEngine:
                 args_json = args if isinstance(args, str) else json.dumps(args, separators=(",", ":"))
                 tool_calls.append({"id": call.get("id") or f"call_{request_id}_{index}", "type": "function",
                                    "function": {"name": name, "arguments": args_json}})
+            choice = request_data.get("tool_choice")
+            if effective_tools and choice == "required" and not tool_calls:
+                raise UpstreamError("Required tool call was not emitted")
+            if effective_tools and isinstance(choice, dict):
+                required_name = (choice.get("function") or {}).get("name")
+                if required_name and not any(
+                    call["function"]["name"] == required_name for call in tool_calls
+                ):
+                    raise UpstreamError(f"Named tool {required_name!r} was not emitted")
             usage = {}
             emit_call(model=model, prompt=prompt, output=content, start_time=started_at,
                       end_time=time.time(), status="success", conversation_id=conversation_id, usage=usage)

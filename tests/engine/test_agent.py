@@ -24,6 +24,7 @@ from agy_bridge.errors import (
     RateLimitExceeded,
     UpstreamAuthRequired,
     UpstreamEmptyResponse,
+    UpstreamError,
     UpstreamTimeout,
     UpstreamUnavailable,
 )
@@ -198,6 +199,58 @@ def test_engine_formats_legacy_tool_envelope(tmp_path):
     assert result["finish_reason"] == "tool_calls"
     assert result["tool_calls"][0]["function"] == {"name": "lookup", "arguments": '{"q":"x"}'}
     assert result["tool_calls"][0]["id"].startswith("call_")
+
+
+@pytest.mark.parametrize("choice", ["required", {"type": "function", "function": {"name": "lookup"}}])
+def test_forced_tool_call_cannot_return_success_without_envelope(tmp_path, choice):
+    engine, transport, _, _ = make_engine(happy_script(), tmp_path)
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    with pytest.raises(UpstreamError, match="tool call|Named tool") as exc:
+        engine.execute_completion({**request(), "tools": tools, "tool_choice": choice})
+    assert exc.value.http_status == 502
+    assert ("DeleteCascadeTrajectory", {"conversationId": "c-1"}) in transport.calls
+
+
+def test_named_tool_call_rejects_wrong_function(tmp_path):
+    envelope = '{"content":null,"tool_calls":[{"name":"other","arguments":{}}]}'
+    script = {
+        "StartCascade": {"cascadeId": "wrong-tool"},
+        "SendUserCascadeMessage": {},
+        "StreamAgentStateUpdates": [
+            {"frame": snap()},
+            {"frame": snap("CASCADE_RUN_STATUS_RUNNING", steps=[step(0, envelope)])},
+            {"frame": snap(steps=[step(0, envelope)])},
+            {"trailer": {"status": 0}},
+        ],
+        "DeleteCascadeTrajectory": {},
+    }
+    engine, _, _, _ = make_engine(script, tmp_path)
+    tools = [{"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+             for name in ("lookup", "other")]
+    with pytest.raises(UpstreamError, match="Named tool 'lookup' was not emitted"):
+        engine.execute_completion({**request(), "tools": tools,
+                                   "tool_choice": {"type": "function", "function": {"name": "lookup"}}})
+
+
+def test_named_tool_call_accepts_matching_function(tmp_path):
+    envelope = '{"content":null,"tool_calls":[{"name":"lookup","arguments":{}}]}'
+    script = {
+        "StartCascade": {"cascadeId": "matching-tool"},
+        "SendUserCascadeMessage": {},
+        "StreamAgentStateUpdates": [
+            {"frame": snap()},
+            {"frame": snap("CASCADE_RUN_STATUS_RUNNING", steps=[step(0, envelope)])},
+            {"frame": snap(steps=[step(0, envelope)])},
+            {"trailer": {"status": 0}},
+        ],
+        "DeleteCascadeTrajectory": {},
+    }
+    engine, _, _, _ = make_engine(script, tmp_path)
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    result = engine.execute_completion({**request(), "tools": tools,
+                                        "tool_choice": {"type": "function", "function": {"name": "lookup"}}})
+    assert result["finish_reason"] == "tool_calls"
+    assert result["tool_calls"][0]["function"]["name"] == "lookup"
 
 
 def test_upstream_stream_and_cleanup_use_started_cascade_id(tmp_path, monkeypatch):
