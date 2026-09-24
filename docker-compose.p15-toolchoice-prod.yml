@@ -1,0 +1,3 @@
+services:
+  agy-bridge:
+    image: agy-bridge:p15-toolchoice-candidate
