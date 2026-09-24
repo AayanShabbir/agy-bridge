@@ -135,3 +135,38 @@ def test_finish_raises_on_truncated_payload():
     decoder.feed(header)
     with pytest.raises(MalformedFrameError, match="unparsed trailing bytes"):
         decoder.finish()
+
+
+def test_default_bound_decodes_observed_large_frame_in_chunks():
+    from agy_bridge.protocol.frames import DEFAULT_MAX_FRAME_BYTES, FrameDecoder, HEADER_STRUCT
+
+    size = 14_824_067
+    payload = b"x" * size
+    wire = HEADER_STRUCT.pack(0, size) + payload
+    decoder = FrameDecoder()
+    frames = []
+    for start in range(0, len(wire), 512 * 1024):
+        frames.extend(decoder.feed(wire[start:start + 512 * 1024]))
+    decoder.finish()
+    assert DEFAULT_MAX_FRAME_BYTES == 16 * 1024 * 1024
+    assert len(frames) == 1
+    assert frames[0].payload == payload
+
+
+def test_default_bound_rejects_over_16_mib_at_header():
+    from agy_bridge.protocol.frames import FrameDecoder, HEADER_STRUCT
+
+    decoder = FrameDecoder()
+    with pytest.raises(FrameTooLargeError, match="exceeds maximum"):
+        decoder.feed(HEADER_STRUCT.pack(0, 16 * 1024 * 1024 + 1))
+
+
+def test_large_frame_still_rejects_unsupported_flags_and_truncated_eof():
+    from agy_bridge.protocol.frames import FrameDecoder, HEADER_STRUCT
+
+    with pytest.raises(MalformedFrameError, match="Unsupported frame flags"):
+        FrameDecoder().feed(HEADER_STRUCT.pack(1, 14_824_067))
+    decoder = FrameDecoder()
+    decoder.feed(HEADER_STRUCT.pack(0, 14_824_067) + b"partial")
+    with pytest.raises(MalformedFrameError, match="unparsed trailing bytes"):
+        decoder.finish()

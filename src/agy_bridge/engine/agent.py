@@ -319,7 +319,16 @@ class AgyCompletionEngine:
 
         endpoint = lane["endpoint"] if lane and lane.get("endpoint") else self.scheduler.select_endpoint()
         conv_lease = self.leases.acquire_conversation_lease(conversation_id, turn_id)
-        engine_lease = self.leases.acquire_engine_lease(endpoint.engine_id, turn_id)
+        try:
+            engine_lease = self.leases.acquire_engine_lease_wait(
+                endpoint.engine_id,
+                turn_id,
+                ttl_seconds=max(360.0, self.timeout + 60.0),
+                wait_timeout_s=min(30.0, self.timeout),
+            )
+        except BaseException:
+            self.leases.release_conversation_lease(conv_lease)
+            raise
         lifecycle = TurnLifecycleCoordinator(
             request_id=request_id,
             turn_id=turn_id,

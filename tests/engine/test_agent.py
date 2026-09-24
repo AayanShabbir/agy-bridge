@@ -310,6 +310,23 @@ def test_ordering_subscribe_before_send(tmp_path):
     assert methods.index("StreamAgentStateUpdates") < methods.index("SendUserCascadeMessage")
 
 
+def test_engine_admission_timeout_releases_stateful_conversation_lease_before_upstream(tmp_path, monkeypatch):
+    from agy_bridge.errors import LeaseConflictError
+
+    engine, transport, leases, _ = make_engine(happy_script(), tmp_path, timeout=0.05)
+    conversation_id = "stateful-conversation"
+
+    def timeout_admission(*args, **kwargs):
+        raise LeaseConflictError("engine admission timed out")
+
+    monkeypatch.setattr(leases, "acquire_engine_lease_wait", timeout_admission)
+    with pytest.raises(LeaseConflictError, match="timed out"):
+        engine.execute_completion(request(conversation_id=conversation_id))
+
+    assert leases.get_active_lease(conversation_id) is None
+    assert transport.calls == []
+
+
 def test_accepted_stream_sends_before_delayed_frames_and_returns_current_answer(tmp_path):
     send_started = threading.Event()
     delayed_frames = [

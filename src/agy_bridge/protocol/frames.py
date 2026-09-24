@@ -11,7 +11,7 @@ from typing import List
 
 from agy_bridge.errors import FrameTooLargeError, MalformedFrameError
 
-DEFAULT_MAX_FRAME_BYTES: int = 8 * 1024 * 1024  # 8 MiB
+DEFAULT_MAX_FRAME_BYTES: int = 16 * 1024 * 1024  # 16 MiB
 HEADER_STRUCT: struct.Struct = struct.Struct(">BI")
 HEADER_SIZE: int = HEADER_STRUCT.size  # 5 bytes
 
