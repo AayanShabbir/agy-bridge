@@ -6,6 +6,7 @@ send) and the plan's terminal-evidence rules (silence never proves completion).
 """
 from __future__ import annotations
 
+import threading
 import uuid
 
 import pytest
@@ -18,7 +19,7 @@ from agy_bridge.engine.lifecycle import AttachmentTimeoutError
 from agy_bridge.engine.recovery import RecoveryCoordinator
 from agy_bridge.engine.registry import RegistryManager
 from agy_bridge.engine.scheduler import AccountStatusTracker, AccountScheduler
-from agy_bridge.engine.transport import ScriptedTransport
+from agy_bridge.engine.transport import ScriptedTransport, SubscriptionResult
 from agy_bridge.errors import (
     RateLimitExceeded,
     UpstreamAuthRequired,
@@ -174,6 +175,45 @@ def test_ordering_subscribe_before_send(tmp_path):
     assert methods.index("StreamAgentStateUpdates") < methods.index("SendUserCascadeMessage")
 
 
+def test_accepted_stream_sends_before_delayed_frames_and_returns_current_answer(tmp_path):
+    send_started = threading.Event()
+    delayed_frames = [
+        snap(steps=[step(7, "OLD ANSWER")]),
+        snap("CASCADE_RUN_STATUS_RUNNING", steps=[step(7, "OLD ANSWER")]),
+        snap("CASCADE_RUN_STATUS_RUNNING", steps=[step(7, "OLD ANSWER"), step(8, "NEW ANSWER")]),
+        snap(steps=[step(7, "OLD ANSWER"), step(8, "NEW ANSWER")]),
+    ]
+
+    class AcceptedBeforeFramesTransport(ScriptedTransport):
+        def subscribe(self, endpoint, method, payload, *, on_frame, timeout=60.0, on_open=None):
+            self.calls.append((method, payload))
+            if on_open is not None:
+                on_open()
+            assert send_started.wait(timeout=1.0), "engine did not send after accepted stream headers"
+            for frame in delayed_frames:
+                on_frame(frame)
+            return SubscriptionResult(outcome=SubscriptionResult.COMPLETED)
+
+    script = {
+        "StartCascade": {"cascadeId": "fresh-cascade"},
+        "SendUserCascadeMessage": lambda payload: (send_started.set() or {}),
+        "DeleteCascadeTrajectory": {},
+    }
+    transport = AcceptedBeforeFramesTransport(script=script)
+    engine, _, leases, _ = make_engine({}, tmp_path)
+    engine.transport = transport
+    engine.attach_timeout = 0.2
+
+    result = engine.execute_completion(request())
+
+    assert result["content"] == "NEW ANSWER"
+    assert [method for method, _ in transport.calls].count("SendUserCascadeMessage") == 1
+    stream_payload = next(payload for method, payload in transport.calls if method == "StreamAgentStateUpdates")
+    assert stream_payload["conversationId"] == "fresh-cascade"
+    assert ("DeleteCascadeTrajectory", {"conversationId": "fresh-cascade"}) in transport.calls
+    assert leases.get_active_lease("conv-1") is None
+
+
 def test_fresh_cascade_without_replay(tmp_path):
     script = {
         "StartCascade": {"cascadeId": "c-9"},
@@ -215,11 +255,65 @@ def test_attachment_timeout_blocks_send(tmp_path):
         "StreamAgentStateUpdates": [],  # no frames ever
         "DeleteCascadeTrajectory": {},
     }
-    engine, transport, leases, _ = make_engine(script, tmp_path)
+    engine, _, leases, _ = make_engine(script, tmp_path)
+
+    class NeverAcceptedTransport(ScriptedTransport):
+        def subscribe(self, endpoint, method, payload, *, on_frame, timeout=60.0, on_open=None):
+            self.calls.append((method, payload))
+            return SubscriptionResult(outcome=SubscriptionResult.TERMINATED)
+
+    transport = NeverAcceptedTransport(script=script)
+    engine.transport = transport
     with pytest.raises(AttachmentTimeoutError):
         engine.execute_completion(request())
     methods = [m for m, _ in transport.calls]
     assert "SendUserCascadeMessage" not in methods
+
+
+def test_rejected_stream_handshake_does_not_send(tmp_path):
+    script = {
+        "StartCascade": {"cascadeId": "c-1"},
+        "SendUserCascadeMessage": {},
+        "StreamAgentStateUpdates": UpstreamUnavailable("HTTP 503 from stream handshake"),
+        "DeleteCascadeTrajectory": {},
+    }
+    engine, transport, _, _ = make_engine(script, tmp_path)
+
+    with pytest.raises(UpstreamUnavailable, match="handshake"):
+        engine.execute_completion(request())
+
+    assert "SendUserCascadeMessage" not in [method for method, _ in transport.calls]
+
+
+def test_stream_failure_after_send_is_outcome_unknown_and_not_retried(tmp_path, monkeypatch):
+    import agy_bridge.engine.agent as agent_module
+
+    certainty_after_disconnect = []
+    original_lifecycle = agent_module.TurnLifecycleCoordinator
+
+    class TrackingLifecycle(original_lifecycle):
+        def handle_disconnect(self, reason):
+            super().handle_disconnect(reason)
+            certainty_after_disconnect.append(self.certainty)
+
+    monkeypatch.setattr(agent_module, "TurnLifecycleCoordinator", TrackingLifecycle)
+    script = {
+        "StartCascade": {"cascadeId": "c-1"},
+        "SendUserCascadeMessage": {},
+        "StreamAgentStateUpdates": [
+            {"error": UpstreamUnavailable("stream reset after acceptance")},
+        ],
+        "DeleteCascadeTrajectory": {},
+    }
+    engine, transport, _, _ = make_engine(script, tmp_path)
+
+    with pytest.raises(UpstreamUnavailable, match="after acceptance"):
+        engine.execute_completion(request())
+
+    methods = [method for method, _ in transport.calls]
+    assert methods.count("SendUserCascadeMessage") == 1
+    assert methods.count("StreamAgentStateUpdates") == 1
+    assert certainty_after_disconnect == [SubmissionCertainty.OUTCOME_UNKNOWN]
 
 
 def test_send_failure_is_not_sent_and_force_stops(tmp_path):

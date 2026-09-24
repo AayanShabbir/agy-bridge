@@ -98,10 +98,13 @@ class EngineTransport(Protocol):
         *,
         on_frame: Callable[[Any], Optional[bool]],
         timeout: float = 60.0,
+        on_open: Optional[Callable[[], None]] = None,
     ) -> SubscriptionResult:
-        """Stream data frames to on_frame; return the terminal outcome.
+        """Stream data frames and report acceptance separately from first data.
 
-        on_frame may return True to stop early (cancelled, not an error).
+        on_open fires after a successful HTTP response and immediate gRPC
+        status validation, before any response-body read. on_frame may return
+        True to stop early (cancelled, not an error).
         """
         ...
 
@@ -237,12 +240,14 @@ class AgyHttpTransport:
         *,
         on_frame: Callable[[Any], Optional[bool]],
         timeout: float = 60.0,
+        on_open: Optional[Callable[[], None]] = None,
     ) -> SubscriptionResult:
         ep = self._endpoint(endpoint)
         conn = self._connect(ep)
         decoder = FrameDecoder()
         result = SubscriptionResult()
         grpc_timeout_ms = max(1, int(timeout * 1000))
+        stream_deadline: Optional[float] = None
         try:
             body = encode_frame(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
             headers = self._headers(ep)
@@ -255,10 +260,18 @@ class AgyHttpTransport:
             )
             response = conn.getresponse()
             self._decode_http_status(method, response.status, response.reason, response.headers)
+            if on_open is not None:
+                on_open()
+            stream_deadline = time.monotonic() + timeout
 
             saw_trailer = False
             while True:
-                chunk = response.read(self.read_chunk_bytes)
+                remaining = stream_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("stream body deadline expired")
+                if conn.sock is not None:
+                    conn.sock.settimeout(remaining)
+                chunk = response.read1(self.read_chunk_bytes)
                 if chunk:
                     for frame in decoder.feed(chunk):
                         if frame.is_trailer:
@@ -297,7 +310,13 @@ class AgyHttpTransport:
                     )
                 return result
         except (socket.timeout, TimeoutError) as ex:
-            raise UpstreamTimeout(f"{method} stream timed out after {timeout}s") from ex
+            if stream_deadline is None:
+                raise UpstreamTimeout(
+                    f"{method} HTTP handshake timed out after {self.connect_timeout}s"
+                ) from ex
+            raise UpstreamTimeout(
+                f"{method} stream body timed out after {timeout}s"
+            ) from ex
         except (OSError, http.client.HTTPException) as ex:
             raise UpstreamUnavailable(f"{method} stream failed at transport: {ex}") from ex
         finally:
@@ -351,11 +370,14 @@ class ScriptedTransport:
         *,
         on_frame: Callable[[Any], Optional[bool]],
         timeout: float = 60.0,
+        on_open: Optional[Callable[[], None]] = None,
     ) -> SubscriptionResult:
         self.calls.append((method, payload))
         entry = self.script.get(method, self.default)
         if isinstance(entry, Exception):
             raise entry
+        if on_open is not None:
+            on_open()
         if callable(entry):
             return cast(SubscriptionResult, entry(payload, on_frame))
         result = SubscriptionResult(outcome=STREAM_TERMINATED, error="scripted transport: no trailer received")

@@ -6,7 +6,7 @@ app_lane.py:
 
   1. StartCascade -> cascadeId
   2. SUBSCRIBE FIRST (the server only pushes updates to attached subscribers)
-  3. verify attachment from the first frame (baseline snapshot), THEN
+  3. wait for an accepted/open stream handshake, THEN
   4. SendUserCascadeMessage (bounded, once per turn)
   5. consume state updates; attribute strictly to this turn via the
      trajectory reducer (prior-turn steps below the baseline are rejected);
@@ -49,6 +49,7 @@ from agy_bridge.protocol.trajectory import parse_agent_state_update, reduce_upda
 SOURCE_CASCADE_CLIENT = "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT"
 VERBOSITY_FULL = "CLIENT_TRAJECTORY_VERBOSITY_FULL"
 CASCADE_RUNNING = "CASCADE_RUN_STATUS_RUNNING"
+_STREAM_OPENED = object()
 
 DEFAULT_MODEL_ENUM = os.environ.get("AGY_APP_MODEL_ENUM", "MODEL_PLACEHOLDER_M319")
 
@@ -251,6 +252,7 @@ class AgyCompletionEngine:
                     },
                     on_frame=lambda d: (frame_q.put(d), False)[1],
                     timeout=stream_timeout,
+                    on_open=lambda: frame_q.put(_STREAM_OPENED),
                 )
             except Exception as ex:  # typed transport errors
                 frame_q.put(ex)
@@ -278,12 +280,13 @@ class AgyCompletionEngine:
             assert cascade_id is not None  # _pre_send_fail raised otherwise
             upstream_conversation_id = cascade_id
 
-            # 2. Subscribe FIRST, then verify attachment (baseline snapshot).
-            #    The server only pushes updates to attached subscribers.
+            # 2. Subscribe FIRST, then wait for HTTP/gRPC acceptance.
+            #    StartCascade made this a fresh upstream cascade, so baseline
+            #    zero is safe until pre-run replay frames can refine it.
             lifecycle.begin_subscription()
             _relaunch_stream()
-            first_frame = self._wait_attachment(frame_q, lifecycle)
-            baseline = self._baseline_step_count(first_frame)
+            self._wait_attachment(frame_q, lifecycle)
+            baseline = 0
             lifecycle.record_attachment(baseline)
 
             # 3. Send the turn message exactly once
@@ -331,7 +334,7 @@ class AgyCompletionEngine:
     # -- turn mechanics ------------------------------------------------------
 
     def _wait_attachment(self, frame_q: "queue.Queue[Any]",
-                         lifecycle: TurnLifecycleCoordinator) -> dict:
+                         lifecycle: TurnLifecycleCoordinator) -> None:
         attach_deadline = time.monotonic() + self.attach_timeout
         while time.monotonic() < attach_deadline:
             try:
@@ -339,14 +342,16 @@ class AgyCompletionEngine:
             except queue.Empty:
                 continue
             if data is None:
-                break  # stream ended with no frames
+                break  # stream ended before the HTTP/gRPC handshake was accepted
             if isinstance(data, Exception):
                 lifecycle.handle_disconnect(str(data))
                 raise data
-            return data
-        lifecycle.handle_timeout(f"subscription did not attach within {self.attach_timeout}s")
+            if data is _STREAM_OPENED:
+                return
+            # A data frame is not proof that the HTTP/gRPC handshake succeeded.
+        lifecycle.handle_timeout(f"stream was not accepted within {self.attach_timeout}s")
         raise AttachmentTimeoutError(
-            "Cannot submit message: subscription not attached within "
+            "Cannot submit message: stream handshake was not accepted within "
             f"{self.attach_timeout}s"
         )
 
@@ -377,6 +382,7 @@ class AgyCompletionEngine:
         """Consume frames until terminal evidence, re-attaching once if needed."""
         deadline = time.monotonic() + min(max(self.timeout, self.min_deadline_s), 300.0)
         saw_running = False
+        baseline_open = True
         reattached = False
 
         while time.monotonic() < deadline:
@@ -396,12 +402,20 @@ class AgyCompletionEngine:
                     relaunch()
                     continue
                 break
+            if data is _STREAM_OPENED:
+                continue  # re-attachment accepted; not a trajectory frame
 
             update = data.get("update") if isinstance(data.get("update"), dict) else data
             status = str(update.get("status") or "")
             if status == CASCADE_RUNNING:
                 saw_running = True
+                baseline_open = False
             if not saw_running:
+                if baseline_open:
+                    current_baseline = lifecycle.observation.baseline_step_count or 0
+                    lifecycle.observation.baseline_step_count = max(
+                        current_baseline, self._baseline_step_count(data)
+                    )
                 continue  # pre-run snapshot / replayed prior-turn history
 
             parsed = parse_agent_state_update(data)

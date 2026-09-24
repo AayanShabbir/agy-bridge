@@ -50,6 +50,7 @@ def trailer_bytes(status: int = 0, message: str | None = None) -> bytes:
 class ScriptedGrpcHandler(http.server.BaseHTTPRequestHandler):
     """Serves scripted per-path byte chunks like the language server."""
 
+    protocol_version = "HTTP/1.1"
     script: dict = {}
     requests: list = []
 
@@ -57,6 +58,7 @@ class ScriptedGrpcHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def _serve(self) -> None:
+        self.close_connection = True
         entry = type(self).script.get(self.path)
         if entry is None:
             self.send_response(404)
@@ -70,17 +72,33 @@ class ScriptedGrpcHandler(http.server.BaseHTTPRequestHandler):
                 "body": body,
             }
         )
-        self.send_response(int(entry.get("status", 200)))
-        if entry.get("grpc_status") is not None:
-            self.send_header("grpc-status", str(entry["grpc_status"]))
-        if entry.get("grpc_message"):
-            self.send_header("grpc-message", entry["grpc_message"])
-        self.send_header("content-type", "application/grpc-web+json")
-        self.end_headers()
+        if entry.get("header_delay"):
+            time.sleep(float(entry["header_delay"]))
+        try:
+            self.send_response(int(entry.get("status", 200)))
+            if entry.get("grpc_status") is not None:
+                self.send_header("grpc-status", str(entry["grpc_status"]))
+            if entry.get("grpc_message"):
+                self.send_header("grpc-message", entry["grpc_message"])
+            self.send_header("content-type", "application/grpc-web+json")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        if entry.get("initial_delay"):
+            time.sleep(float(entry["initial_delay"]))
         for chunk in entry.get("responses", []):
-            self.wfile.write(chunk)
-            self.wfile.flush()
+            try:
+                self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii") + chunk + b"\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
             time.sleep(float(entry.get("delay", 0)))
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     do_POST = _serve
     do_GET = _serve
@@ -264,6 +282,91 @@ def test_subscribe_grpc_timeout_header(grpc_server):
     assert handler.requests[0]["headers"].get("grpc-timeout") == "90000m"
 
 
+def test_subscribe_accepts_headers_before_delayed_body_and_uses_read_deadline(grpc_server):
+    server, handler = grpc_server
+    handler.script["/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates"] = {
+        "initial_delay": 0.65,
+        "responses": [data_frame({"update": {"status": "CASCADE_RUN_STATUS_RUNNING"}}), trailer_bytes()],
+    }
+    transport = AgyHttpTransport(connect_timeout=0.5)
+    ep = make_endpoint(server.server_address[1])
+    received = []
+    accepted = []
+    started = time.monotonic()
+
+    result = transport.subscribe(
+        ep,
+        "StreamAgentStateUpdates",
+        {"conversationId": "fresh-cascade"},
+        on_frame=received.append,
+        on_open=lambda: accepted.append((time.monotonic(), len(received))),
+        timeout=2.0,
+    )
+
+    assert len(accepted) == 1
+    assert accepted[0][1] == 0
+    assert received[0]["update"]["status"] == "CASCADE_RUN_STATUS_RUNNING"
+    assert result.outcome == SubscriptionResult.COMPLETED
+    assert time.monotonic() - started > transport.connect_timeout
+
+
+def test_subscribe_body_timeout_reports_body_phase_and_bound(grpc_server):
+    server, handler = grpc_server
+    handler.script["/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates"] = {
+        "initial_delay": 0.2,
+        "responses": [data_frame({"update": {"status": "CASCADE_RUN_STATUS_RUNNING"}})],
+    }
+    transport = AgyHttpTransport(connect_timeout=1.0)
+
+    with pytest.raises(UpstreamTimeout, match=r"body.*0\.05s"):
+        transport.subscribe(
+            make_endpoint(server.server_address[1]),
+            "StreamAgentStateUpdates",
+            {},
+            on_frame=lambda data: None,
+            timeout=0.05,
+        )
+
+
+def test_subscribe_handshake_timeout_reports_handshake_phase_and_bound(grpc_server):
+    server, handler = grpc_server
+    handler.script["/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates"] = {
+        "header_delay": 0.2,
+        "responses": [trailer_bytes()],
+    }
+    transport = AgyHttpTransport(connect_timeout=0.05)
+
+    with pytest.raises(UpstreamTimeout, match=r"handshake.*0\.05s"):
+        transport.subscribe(
+            make_endpoint(server.server_address[1]),
+            "StreamAgentStateUpdates",
+            {},
+            on_frame=lambda data: None,
+            timeout=2.0,
+        )
+
+
+def test_subscribe_rejected_http_status_does_not_signal_open(grpc_server):
+    server, handler = grpc_server
+    handler.script["/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates"] = {
+        "status": 503,
+        "responses": [],
+    }
+    opened = []
+
+    with pytest.raises(UpstreamUnavailable):
+        AgyHttpTransport().subscribe(
+            make_endpoint(server.server_address[1]),
+            "StreamAgentStateUpdates",
+            {},
+            on_frame=lambda data: None,
+            on_open=lambda: opened.append(True),
+            timeout=2.0,
+        )
+
+    assert opened == []
+
+
 def test_subscribe_eof_without_trailer_is_incomplete(grpc_server):
     server, handler = grpc_server
     handler.script["/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates"] = {
@@ -316,8 +419,17 @@ def test_subscribe_grpc_status_header_fails_immediately(grpc_server):
     }
     transport = AgyHttpTransport()
     ep = make_endpoint(server.server_address[1])
+    opened = []
     with pytest.raises(RateLimitExceeded):
-        transport.subscribe(ep, "StreamAgentStateUpdates", {}, on_frame=lambda d: None, timeout=30)
+        transport.subscribe(
+            ep,
+            "StreamAgentStateUpdates",
+            {},
+            on_frame=lambda d: None,
+            on_open=lambda: opened.append(True),
+            timeout=30,
+        )
+    assert opened == []
 
 
 def test_subscribe_malformed_frame_flags_raise(grpc_server):
